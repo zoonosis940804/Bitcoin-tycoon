@@ -1,4 +1,5 @@
 ﻿import { useEffect, useMemo, useRef, useState } from "react";
+import { BTC_RET_REAL } from "./btcReturns";
 
 const KRW_RATE = 1473;
 const MONTHLY_SALARY = 3_000_000;
@@ -273,6 +274,24 @@ function studentLike(seed, ...parts) {
   const chi = Math.max(1e-9, v1 * v1 + v2 * v2 + v3 * v3 + v4 * v4 + v5 * v5);
   return z / Math.sqrt(chi / 5);
 }
+const BTC_RET_MEAN_ABS = BTC_RET_REAL.reduce((s, r) => s + Math.abs(r), 0) / Math.max(1, BTC_RET_REAL.length);
+const BTC_RET_BUCKETS = (() => {
+  const out = { bull: [], bear: [], chop: [], all: [] };
+  const look = 12;
+  for (let i = 0; i < BTC_RET_REAL.length - look - 1; i++) {
+    out.all.push(i);
+    const w = BTC_RET_REAL.slice(i, i + look);
+    const m = w.reduce((s, x) => s + x, 0) / look;
+    const a = w.reduce((s, x) => s + Math.abs(x), 0) / look;
+    if (m > 0.004) out.bull.push(i);
+    if (m < -0.004) out.bear.push(i);
+    if (Math.abs(m) < 0.0016 && a < 0.022) out.chop.push(i);
+  }
+  if (out.bull.length === 0) out.bull = [...out.all];
+  if (out.bear.length === 0) out.bear = [...out.all];
+  if (out.chop.length === 0) out.chop = [...out.all];
+  return out;
+})();
 function makeScenario(seed) {
   return {
     btcBias: randSigned(seed, "bb") * 0.0009,
@@ -537,6 +556,9 @@ function normalizeGame(raw) {
     btcTrend: raw.btcTrend ?? 0,
     btcRegime: raw.btcRegime ?? "chop",
     btcRegimeLeft: raw.btcRegimeLeft ?? 0,
+    btcBlockStart: raw.btcBlockStart ?? 0,
+    btcBlockOffset: raw.btcBlockOffset ?? 0,
+    btcBlockRemain: raw.btcBlockRemain ?? 0,
     endYear: raw.endYear ?? 2041,
     myNick: raw.myNick ?? "플레이어",
     pauseLimit: raw.pauseLimit ?? 3,
@@ -1363,21 +1385,24 @@ export default function App() {
         const prevTrend = p.btcTrend || 0;
         let btcRegime = p.btcRegime || "chop";
         let btcRegimeLeft = p.btcRegimeLeft || 0;
+        let btcBlockStart = p.btcBlockStart || 0;
+        let btcBlockOffset = p.btcBlockOffset || 0;
+        let btcBlockRemain = p.btcBlockRemain || 0;
         const regimeTransition = {
           chop: [
-            ["chop", 0.90], ["bull", 0.04], ["bear", 0.04], ["panic", 0.01], ["squeeze", 0.01],
+            ["chop", 0.91], ["bull", 0.035], ["bear", 0.04], ["panic", 0.008], ["squeeze", 0.007],
           ],
           bull: [
-            ["bull", 0.92], ["chop", 0.04], ["squeeze", 0.02], ["bear", 0.01], ["panic", 0.01],
+            ["bull", 0.93], ["chop", 0.04], ["squeeze", 0.016], ["bear", 0.01], ["panic", 0.004],
           ],
           bear: [
-            ["bear", 0.93], ["chop", 0.04], ["panic", 0.02], ["bull", 0.005], ["squeeze", 0.005],
+            ["bear", 0.935], ["chop", 0.045], ["panic", 0.014], ["bull", 0.004], ["squeeze", 0.002],
           ],
           panic: [
-            ["panic", 0.72], ["bear", 0.20], ["chop", 0.07], ["bull", 0.005], ["squeeze", 0.005],
+            ["panic", 0.78], ["bear", 0.16], ["chop", 0.05], ["bull", 0.005], ["squeeze", 0.005],
           ],
           squeeze: [
-            ["squeeze", 0.74], ["bull", 0.17], ["chop", 0.07], ["bear", 0.01], ["panic", 0.01],
+            ["squeeze", 0.8], ["bull", 0.13], ["chop", 0.05], ["bear", 0.01], ["panic", 0.01],
           ],
         };
         if (btcRegimeLeft <= 0) {
@@ -1390,42 +1415,61 @@ export default function App() {
             if (u <= acc) { nextReg = tr[i][0]; break; }
           }
           btcRegime = nextReg;
-          const durMap = { chop: [2, 24], bear: [5, 34], bull: [4, 28], panic: [1, 9], squeeze: [1, 8] };
+          const durMap = { chop: [3, 45], bear: [6, 55], bull: [5, 44], panic: [2, 12], squeeze: [2, 10] };
           const [lo, hi] = durMap[btcRegime] || [2, 16];
           btcRegimeLeft = lo + Math.floor(rand01(p.gameSeed || 1, "btc_regime_dur", y, m, d) * (hi - lo + 1));
         } else {
           btcRegimeLeft -= 1;
         }
         const reg = {
-          chop: { drift: 0.0, volMul: 0.9, phi: 0.11 },
-          bear: { drift: -0.0013, volMul: 1.45, phi: 0.22 },
-          bull: { drift: 0.0011, volMul: 1.22, phi: 0.2 },
-          panic: { drift: -0.0041, volMul: 2.3, phi: 0.31 },
-          squeeze: { drift: 0.0032, volMul: 2.0, phi: 0.29 },
-        }[btcRegime] || { drift: 0, volMul: 1, phi: 0.1 };
-        // GARCH-like volatility update (prevents easy alternation and allows clustered chaos)
+          chop: { drift: 0.0, volMul: 0.86, phi: 0.08, scale: 0.95, jumpExtra: 0.0 },
+          bear: { drift: -0.0010, volMul: 1.16, phi: 0.17, scale: 1.06, jumpExtra: 0.004 },
+          bull: { drift: 0.00085, volMul: 1.04, phi: 0.15, scale: 1.02, jumpExtra: 0.002 },
+          panic: { drift: -0.0023, volMul: 1.42, phi: 0.23, scale: 1.18, jumpExtra: 0.009 },
+          squeeze: { drift: 0.0021, volMul: 1.35, phi: 0.21, scale: 1.16, jumpExtra: 0.009 },
+        }[btcRegime] || { drift: 0, volMul: 1, phi: 0.1, scale: 1, jumpExtra: 0 };
+        // GARCH-like volatility update calibrated to real BTC daily return stats (2019+).
         const omega = 0.000018;
         const alpha = 0.19;
         const beta = 0.79;
         const prevVar = Math.max(0.00003, prevVol * prevVol);
         const newVar = clamp(omega + alpha * prevRet * prevRet + beta * prevVar, 0.00002, 0.07);
-        const btcVol = clamp(Math.sqrt(newVar) * reg.volMul, 0.009, 0.22);
-        // Slowly varying latent trend (supports long streaks and long sideways)
-        const trendNoise = gaussian(p.gameSeed || 1, "btc_trend", y, m, d) * 0.00055;
-        const btcTrend = clamp(prevTrend * 0.985 + trendNoise + reg.drift * 0.08, -0.0085, 0.0085);
-        // Heavy-tail noise + short memory shock
-        const tail = studentLike(p.gameSeed || 1, "btc_tail", y, m, d);
-        const eps = clamp(prevEps * 0.33 + tail * btcVol * 0.78, -0.34, 0.34);
-        const drift = 0.00008 + projectedDrift("btc", y, m) * 0.2 + (p.scenario?.btcBias || 0) * 0.15 + macroMul.btc * 0.32 + phasePenalty.btc * 0.4 + ratePenalty.btc * 0.82 + btcTrend;
-        const ar = clamp(prevRet * reg.phi, -0.14, 0.14);
+        const btcVol = clamp(Math.sqrt(newVar) * reg.volMul, 0.008, 0.11);
+        // Slowly varying latent trend and persistence without deterministic wave patterns.
+        const trendNoise = gaussian(p.gameSeed || 1, "btc_trend", y, m, d) * 0.00032;
+        const btcTrend = clamp(prevTrend * 0.989 + trendNoise + reg.drift * 0.07, -0.0052, 0.0052);
+
+        // Empirical block bootstrap from real BTC daily returns.
+        if (btcBlockRemain <= 0) {
+          const bucket = btcRegime === "bull" ? BTC_RET_BUCKETS.bull : btcRegime === "bear" || btcRegime === "panic" ? BTC_RET_BUCKETS.bear : BTC_RET_BUCKETS.chop;
+          const pick = bucket[Math.floor(rand01(p.gameSeed || 1, "btc_block_start", y, m, d) * bucket.length)] ?? 0;
+          const lenMap = { chop: [4, 30], bull: [5, 24], bear: [6, 28], panic: [2, 8], squeeze: [2, 7] };
+          const [lo, hi] = lenMap[btcRegime] || [4, 20];
+          const bl = lo + Math.floor(rand01(p.gameSeed || 1, "btc_block_len", y, m, d) * (hi - lo + 1));
+          btcBlockStart = pick;
+          btcBlockOffset = 0;
+          btcBlockRemain = bl;
+        } else {
+          btcBlockOffset += 1;
+          btcBlockRemain -= 1;
+        }
+        const srcIdx = (btcBlockStart + btcBlockOffset) % BTC_RET_REAL.length;
+        const empiricalRet = BTC_RET_REAL[srcIdx] || 0;
+        const empiricalScaled = empiricalRet * reg.scale;
+
+        // Residual heavy-tail shock (small), keeps unpredictability without absurd 40% daily jumps.
+        const tail = studentLike(p.gameSeed || 1, "btc_tail", y, m, d) * btcVol * 0.35;
+        const eps = clamp(prevEps * 0.35 + tail, -0.12, 0.12);
+        const drift = reg.drift + (p.scenario?.btcBias || 0) * 0.08 + macroMul.btc * 0.22 + phasePenalty.btc * 0.25 + ratePenalty.btc * 0.55 + btcTrend;
+        const ar = clamp(prevRet * reg.phi, -0.08, 0.08);
         const jRoll = rand01(p.gameSeed || 1, "btc_jump", y, m, d);
-        const jProb = clamp(0.008 + btcVol * 0.4 + (btcRegime === "panic" || btcRegime === "squeeze" ? 0.03 : 0), 0.008, 0.2);
+        const jProb = clamp(0.003 + btcVol * 0.09 + reg.jumpExtra, 0.003, 0.035);
         const jMagSeed = rand01(p.gameSeed || 1, "btc_jump_mag", y, m, d);
         const dirSeed = gaussian(p.gameSeed || 1, "btc_jump_dir", y, m, d);
-        const dirBias = (btcRegime === "bear" ? -0.45 : 0) + (btcRegime === "panic" ? -0.85 : 0) + (btcRegime === "bull" ? 0.35 : 0) + (btcRegime === "squeeze" ? 0.75 : 0);
+        const dirBias = (btcRegime === "bear" ? -0.35 : 0) + (btcRegime === "panic" ? -0.55 : 0) + (btcRegime === "bull" ? 0.28 : 0) + (btcRegime === "squeeze" ? 0.45 : 0);
         const jDir = (dirSeed + dirBias) >= 0 ? 1 : -1;
-        const jump = jRoll < jProb ? jDir * (0.012 + Math.pow(jMagSeed, 0.45) * 0.26) : 0;
-        const dailyRet = clamp(drift + ar + eps + jump, -0.45, 0.45);
+        const jump = jRoll < jProb ? jDir * (0.018 + Math.pow(jMagSeed, 0.72) * 0.06) : 0;
+        const dailyRet = clamp(empiricalScaled + drift + ar + eps + jump, -0.18, 0.18);
         let btcUsd = Math.max(7000, p.btcUsd * (1 + dailyRet));
         const ev = EVENTS.find((e) => e.y === y && e.m === m && e.d === d);
         if (ev && !p.doneEvents.includes(`${ev.y}-${ev.m}-${ev.d}`)) {
@@ -1856,6 +1900,9 @@ export default function App() {
           btcTrend,
           btcRegime,
           btcRegimeLeft,
+          btcBlockStart,
+          btcBlockOffset,
+          btcBlockRemain,
           cash,
           btc,
           deposits,
