@@ -1,7 +1,12 @@
-﻿import { useEffect, useMemo, useRef, useState } from "react";
+﻿import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { BTC_RET_REAL } from "./btcReturns";
 
 const KRW_RATE = 1473;
 const MONTHLY_SALARY = 3_000_000;
+const DEFAULT_WS_URL =
+  typeof window !== "undefined" && (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1")
+    ? "ws://127.0.0.1:8787"
+    : "wss://bitcoin-tycoon-rt.onrender.com";
 const MO = ["1월", "2월", "3월", "4월", "5월", "6월", "7월", "8월", "9월", "10월", "11월", "12월"];
 const DIM = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 
@@ -26,6 +31,28 @@ const fw = (v) => {
 const fusd = (v) => `$${comma(v)}`;
 const fp = (n) => `${n >= 0 ? "+" : ""}${n.toFixed(2)}%`;
 const fdate = (y, m, d) => `${y}년 ${MO[m - 1]} ${d}일`;
+const CHART_SKINS = {
+  binance: {
+    name: "바이낸스",
+    bg: "#0b1220",
+    grid: "#223046",
+    text: "#8ea0b7",
+    up: "#0ecb81",
+    down: "#f6465d",
+    frame: "#334155",
+    watermark: "BINANCE",
+  },
+  upbit: {
+    name: "업비트",
+    bg: "#061529",
+    grid: "#1b3658",
+    text: "#96acc6",
+    up: "#26a69a",
+    down: "#ef5350",
+    frame: "#2a4568",
+    watermark: "UPBIT",
+  },
+};
 
 let _audioCtx = null;
 function beep(freq = 880, vol = 0.04, dur = 0.09, type = "sine") {
@@ -249,6 +276,44 @@ function randSigned(seed, ...parts) {
   const v = h32(seed, ...parts) / 0xffffffff;
   return v * 2 - 1;
 }
+function rand01(seed, ...parts) {
+  return h32(seed, ...parts) / 0xffffffff;
+}
+function gaussian(seed, ...parts) {
+  // Deterministic Box-Muller
+  const u1 = Math.max(1e-12, rand01(seed, ...parts, "u1"));
+  const u2 = rand01(seed, ...parts, "u2");
+  return Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+}
+function studentLike(seed, ...parts) {
+  // Heavy-tail approximation: z / sqrt(chi2/df), df≈5
+  const z = gaussian(seed, ...parts, "z");
+  const v1 = gaussian(seed, ...parts, "v1");
+  const v2 = gaussian(seed, ...parts, "v2");
+  const v3 = gaussian(seed, ...parts, "v3");
+  const v4 = gaussian(seed, ...parts, "v4");
+  const v5 = gaussian(seed, ...parts, "v5");
+  const chi = Math.max(1e-9, v1 * v1 + v2 * v2 + v3 * v3 + v4 * v4 + v5 * v5);
+  return z / Math.sqrt(chi / 5);
+}
+const BTC_RET_MEAN_ABS = BTC_RET_REAL.reduce((s, r) => s + Math.abs(r), 0) / Math.max(1, BTC_RET_REAL.length);
+const BTC_RET_BUCKETS = (() => {
+  const out = { bull: [], bear: [], chop: [], all: [] };
+  const look = 12;
+  for (let i = 0; i < BTC_RET_REAL.length - look - 1; i++) {
+    out.all.push(i);
+    const w = BTC_RET_REAL.slice(i, i + look);
+    const m = w.reduce((s, x) => s + x, 0) / look;
+    const a = w.reduce((s, x) => s + Math.abs(x), 0) / look;
+    if (m > 0.004) out.bull.push(i);
+    if (m < -0.004) out.bear.push(i);
+    if (Math.abs(m) < 0.0016 && a < 0.022) out.chop.push(i);
+  }
+  if (out.bull.length === 0) out.bull = [...out.all];
+  if (out.bear.length === 0) out.bear = [...out.all];
+  if (out.chop.length === 0) out.chop = [...out.all];
+  return out;
+})();
 function makeScenario(seed) {
   return {
     btcBias: randSigned(seed, "bb") * 0.0009,
@@ -269,6 +334,102 @@ function marketSignal(seed, y, m, d, scenario) {
     btc: (scenario?.btcBias || 0) + (cycA * 0.007 + cycB * 0.005 + n * 0.005) * vol + regimeAdj * -0.0065,
     eq: (scenario?.eqBias || 0) + (cycA * 0.0032 + n * 0.0024) * vol + regimeAdj * -0.0031,
     re: (scenario?.reBias || 0) + (cycB * 0.0014 + n * 0.0011) * vol + regimeAdj * -0.0018,
+  };
+}
+function regimeProbabilities({ phaseName, fedRate, riskOn, btcVol, eventRiskPct }) {
+  const base = {
+    bull: 0.27,
+    chop: 0.33,
+    bear: 0.24,
+    deepBear: 0.1,
+    squeeze: 0.06,
+  };
+  if (phaseName === "대폭락장") {
+    base.deepBear += 0.22;
+    base.bear += 0.12;
+    base.bull -= 0.18;
+    base.squeeze -= 0.05;
+  } else if (phaseName === "약세장") {
+    base.bear += 0.16;
+    base.deepBear += 0.08;
+    base.bull -= 0.12;
+    base.squeeze -= 0.03;
+  } else if (phaseName === "횡보장") {
+    base.chop += 0.2;
+    base.bull -= 0.08;
+    base.bear -= 0.07;
+  }
+  if (fedRate >= 5.25) {
+    base.bear += 0.11;
+    base.deepBear += 0.08;
+    base.bull -= 0.11;
+  } else if (fedRate <= 3) {
+    base.bull += 0.12;
+    base.squeeze += 0.05;
+    base.bear -= 0.08;
+  }
+  if (riskOn >= 0.18) {
+    base.bull += 0.12;
+    base.squeeze += 0.06;
+    base.bear -= 0.09;
+  } else if (riskOn <= -0.18) {
+    base.bear += 0.11;
+    base.deepBear += 0.05;
+    base.bull -= 0.08;
+  }
+  if (btcVol >= 0.065) {
+    base.deepBear += 0.05;
+    base.squeeze += 0.05;
+    base.chop -= 0.05;
+  }
+  if (eventRiskPct >= 0.45) {
+    base.deepBear += 0.04;
+    base.bear += 0.02;
+    base.bull -= 0.03;
+  }
+  const keys = ["bull", "chop", "bear", "deepBear", "squeeze"];
+  const clamped = {};
+  let sum = 0;
+  keys.forEach((k) => {
+    clamped[k] = Math.max(0.01, base[k]);
+    sum += clamped[k];
+  });
+  return {
+    bull: (clamped.bull / sum) * 100,
+    chop: (clamped.chop / sum) * 100,
+    bear: (clamped.bear / sum) * 100,
+    deepBear: (clamped.deepBear / sum) * 100,
+    squeeze: (clamped.squeeze / sum) * 100,
+  };
+}
+
+function buildNewsBriefing(game, macroRows, probs) {
+  const latest = [...(game.newsLog || [])].reverse().slice(0, 4);
+  const headlines = latest.map((e) => e.title || e.e).filter(Boolean);
+  const topMacro = [...macroRows]
+    .sort((a, b) => {
+      const score = (r) => {
+        if (r.k.includes("레짐")) return 4;
+        if (r.k.includes("연준")) return 3;
+        if (r.k.includes("USD")) return 2;
+        return 1;
+      };
+      return score(b) - score(a);
+    })
+    .slice(0, 2)
+    .map((m) => `${m.k}: ${m.v} (${m.d})`);
+  const dominant = [
+    { k: "상승", v: probs.bull },
+    { k: "횡보", v: probs.chop },
+    { k: "하락", v: probs.bear },
+    { k: "급락", v: probs.deepBear },
+    { k: "쇼트스퀴즈", v: probs.squeeze },
+  ].sort((a, b) => b.v - a.v)[0];
+  return {
+    title: `${game.year}.${String(game.month).padStart(2, "0")} 시장 브리핑`,
+    summary: dominant ? `현재 우세 시나리오: ${dominant.k} (${dominant.v.toFixed(1)}%)` : "시장 시나리오 계산 중",
+    headlines,
+    macros: topMacro,
   };
 }
 function seededShuffle(arr, seed, tag) {
@@ -484,6 +645,7 @@ function buildRivalBoard(startCash, y, m, btcUsd, myTotal, gameSeed = 1) {
       id: r.id,
       name: r.name,
       icon: r.icon,
+      style: r.style,
       wealth,
       roi: investedBase > 0 ? ((wealth - investedBase) / investedBase) * 100 : 0,
       pf: { ...pf, total: wealth },
@@ -507,6 +669,15 @@ function normalizeGame(raw) {
     btc: raw.btc ?? 0,
     btcUsd: raw.btcUsd ?? getBtcUsd(2026, 3, 11),
     btcPrev: raw.btcPrev ?? raw.btcUsd ?? getBtcUsd(2026, 3, 11),
+    btcPrevRet: raw.btcPrevRet ?? 0,
+    btcVol: raw.btcVol ?? 0.028,
+    btcEps: raw.btcEps ?? 0,
+    btcTrend: raw.btcTrend ?? 0,
+    btcRegime: raw.btcRegime ?? "chop",
+    btcRegimeLeft: raw.btcRegimeLeft ?? 0,
+    btcBlockStart: raw.btcBlockStart ?? 0,
+    btcBlockOffset: raw.btcBlockOffset ?? 0,
+    btcBlockRemain: raw.btcBlockRemain ?? 0,
     endYear: raw.endYear ?? 2041,
     myNick: raw.myNick ?? "플레이어",
     pauseLimit: raw.pauseLimit ?? 3,
@@ -526,6 +697,7 @@ function normalizeGame(raw) {
     futOrders: Array.isArray(raw.futOrders) ? raw.futOrders : [],
     ownedTags: Array.isArray(raw.ownedTags) ? raw.ownedTags : [],
     collection: Array.isArray(raw.collection) ? raw.collection : [],
+    codexCrown: !!raw.codexCrown,
     doneEvents: Array.isArray(raw.doneEvents) ? raw.doneEvents : [],
     stats: ensureStats(raw.stats, raw.startCash ?? 100_000_000),
     total: raw.total ?? raw.cash ?? raw.startCash ?? 100_000_000,
@@ -645,6 +817,12 @@ const RARE_EVENTS = [
   { id: "nuclear", name: "핵전쟁 공포 확산", chance: 0.0008, btc: -0.45, eq: -0.38, re: -0.22, months: 14, et: "rare" },
   { id: "etf_supercycle", name: "초대형 ETF 순유입", chance: 0.002, btc: 0.28, eq: 0.12, re: 0.03, months: 7, et: "rare" },
   { id: "liquidity_freeze", name: "글로벌 유동성 경색", chance: 0.0018, btc: -0.26, eq: -0.27, re: -0.1, months: 6, et: "rare" },
+];
+const MEME_EVENTS = [
+  { id: "elon_tweet", name: "밈 트윗 과열", chance: 0.02, btc: 0.035, et: "meme" },
+  { id: "exchange_fud", name: "거래소 FUD 루머", chance: 0.018, btc: -0.032, et: "meme" },
+  { id: "whale_screenshot", name: "고래 지갑 스샷 확산", chance: 0.016, btc: 0.028, et: "meme" },
+  { id: "rekt_day", name: "전 시장 리퀴데이션 데이", chance: 0.014, btc: -0.04, et: "meme" },
 ];
 
 const BOT_NAMES = ["김비트", "이더리", "박호들", "최블록", "정마진", "한코인", "유레버", "오체인"];
@@ -772,13 +950,12 @@ function Setup({ onStart, onContinue, canContinue }) {
   const [cash, setCash] = useState("1");
   const [unit, setUnit] = useState("억원");
   const [mode, setMode] = useState("single");
-  const [nickname, setNickname] = useState("플레이어");
+  const [nickname, setNickname] = useState("");
   const [endYear, setEndYear] = useState(2041);
   const [pauseLimit, setPauseLimit] = useState(3);
   const [fillBots, setFillBots] = useState(true);
   const [customMode, setCustomMode] = useState(false);
   const [roomCode, setRoomCode] = useState("ROOM1");
-  const [serverUrl, setServerUrl] = useState("ws://127.0.0.1:8787");
   const units = { 만원: 1e4, 천만원: 1e7, 억원: 1e8, 십억원: 1e9 };
   const startCash = clamp((parseFloat(cash || "0") || 1) * units[unit], 1e6, 1e13);
   const approxDays = Math.max(30, (endYear - 2026) * 365 + 295);
@@ -787,7 +964,7 @@ function Setup({ onStart, onContinue, canContinue }) {
     <div style={S.bgCenter}>
       <div style={S.card}>
         <h1 style={S.h1}>비트코인 타이쿤</h1>
-        <input value={nickname} onChange={(e) => setNickname(e.target.value.slice(0, 12) || "플레이어")} placeholder="닉네임" style={S.input} />
+        <input value={nickname} onChange={(e) => setNickname(e.target.value.slice(0, 12))} placeholder="트레이더 닉네임" style={S.input} />
         <div style={S.row}>
           <input value={cash} onChange={(e) => setCash(e.target.value)} style={S.input} />
           <select value={unit} onChange={(e) => setUnit(e.target.value)} style={S.select}>
@@ -829,19 +1006,42 @@ function Setup({ onStart, onContinue, canContinue }) {
             {customMode && (
               <>
                 <input value={roomCode} onChange={(e) => setRoomCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 12))} placeholder="방 코드" style={S.input} />
-                <input value={serverUrl} onChange={(e) => setServerUrl(e.target.value)} placeholder="ws://127.0.0.1:8787" style={S.input} />
-                <div style={{ ...S.muted, color: "#f59e0b" }}>서버 시작 후 같은 roomCode로 친구 접속</div>
+                <div style={S.row}>
+                  <button
+                    style={S.chipBtn}
+                    onClick={() => setRoomCode(`BTC${Math.floor(1000 + Math.random() * 9000)}`)}
+                  >
+                    랜덤 코드
+                  </button>
+                  <button
+                    style={S.chipBtn}
+                    onClick={() => {
+                      try {
+                        navigator.clipboard?.writeText(roomCode || "ROOM1");
+                      } catch (_e) {}
+                    }}
+                  >
+                    코드 복사
+                  </button>
+                </div>
+                <div style={{ ...S.muted, color: "#f59e0b" }}>서버 주소는 자동 적용됩니다. 같은 roomCode로 친구 접속</div>
+                <div style={{ ...S.card, background: "#020617", borderColor: "#334155", padding: 8 }}>
+                  <div style={{ ...S.muted, color: "#93c5fd" }}>친구 빠른 시작</div>
+                  <div style={S.muted}>1) 모드: 멀티 + 커스텀모드 ON</div>
+                  <div style={S.muted}>2) 방장만 방 코드 생성 후 공유</div>
+                  <div style={S.muted}>3) 친구는 같은 코드 입력 후 준비 → 시작</div>
+                </div>
               </>
             )}
           </div>
         )}
-        <button style={S.btnPri} onClick={() => onStart({ startCash, mode, nickname: nickname || "플레이어", endYear, pauseLimit, fillBots, customMode, roomCode, serverUrl })}>
+        <button style={S.btnPri} onClick={() => onStart({ startCash, mode, nickname: nickname || "익명 트레이더", endYear, pauseLimit, fillBots, customMode, roomCode })}>
           게임 시작
         </button>
         <div style={S.muted}>종료연도/일시정지/멀티옵션은 게임 시작 시 반영됩니다.</div>
         {canContinue && (
           <button style={S.speed} onClick={onContinue}>
-            이어하기
+            이어하기 (저장 데이터 있음)
           </button>
         )}
       </div>
@@ -849,9 +1049,18 @@ function Setup({ onStart, onContinue, canContinue }) {
   );
 }
 
-function Lobby({ players, onReady, onStart, onBack }) {
+function Lobby({ players, roomState, onReady, onStart, onBack, onApplySettings, onKick }) {
   const me = players.find((p) => !p.isBot && p.icon === "🎮") || players.find((p) => !p.isBot);
   const allReady = players.every((p) => p.ready);
+  const isHost = !!me?.isHost;
+  const [localEndYear, setLocalEndYear] = useState(roomState?.endYear || 2041);
+  const [localPause, setLocalPause] = useState(roomState?.pauseLimit || 3);
+  const [localSpeed, setLocalSpeed] = useState(roomState?.speed || 1);
+  useEffect(() => {
+    setLocalEndYear(roomState?.endYear || 2041);
+    setLocalPause(roomState?.pauseLimit || 3);
+    setLocalSpeed(roomState?.speed || 1);
+  }, [roomState?.endYear, roomState?.pauseLimit, roomState?.speed]);
   return (
     <div style={S.bgCenter}>
       <div style={{ ...S.card, width: 560, maxWidth: "100%" }}>
@@ -861,14 +1070,39 @@ function Lobby({ players, onReady, onStart, onBack }) {
           {players.map((p) => (
             <div key={p.id} style={S.item}>
               <span>{p.icon || "🎮"} {p.nickname} {p.isBot ? "(BOT)" : ""} {!p.isBot ? `· 정지 ${p.pauseLeft ?? 0}회` : ""}</span>
-              <strong style={{ color: p.ready ? "#22c55e" : "#f59e0b" }}>{p.ready ? "준비" : "대기"}</strong>
+              <span style={S.row}>
+                <strong style={{ color: p.ready ? "#22c55e" : "#f59e0b" }}>{p.ready ? "준비" : "대기"}</strong>
+                {isHost && !p.isHost && (
+                  <button style={S.btnDanger} onClick={() => onKick?.(p.id)}>강퇴</button>
+                )}
+              </span>
             </div>
           ))}
         </div>
+        {isHost && (
+          <div style={{ ...S.card, background: "#0b1220", borderColor: "#334155" }}>
+            <div style={{ ...S.muted, marginBottom: 6 }}>방장 설정</div>
+            <div style={S.row}>
+              <span style={S.muted}>종료연도</span>
+              <select value={localEndYear} onChange={(e) => setLocalEndYear(parseInt(e.target.value, 10))} style={S.select}>
+                {Array.from({ length: 20 }, (_, i) => 2028 + i).map((y) => <option key={y} value={y}>{y}</option>)}
+              </select>
+              <span style={S.muted}>일시정지</span>
+              <select value={localPause} onChange={(e) => setLocalPause(parseInt(e.target.value, 10))} style={S.select}>
+                {[1, 2, 3, 4, 5, 6, 7, 8].map((n) => <option key={n} value={n}>{n}회</option>)}
+              </select>
+              <span style={S.muted}>기본 배속</span>
+              <select value={localSpeed} onChange={(e) => setLocalSpeed(parseInt(e.target.value, 10))} style={S.select}>
+                {[1, 2, 4, 10, 20].map((n) => <option key={n} value={n}>{n}x</option>)}
+              </select>
+              <button style={S.btnPri} onClick={() => onApplySettings?.({ endYear: localEndYear, pauseLimit: localPause, speed: localSpeed })}>설정 적용</button>
+            </div>
+          </div>
+        )}
         <div style={S.row}>
           <button style={S.speed} onClick={onBack}>뒤로</button>
           <button style={me?.ready ? S.btnDanger : S.btnPri} onClick={onReady}>{me?.ready ? "준비취소" : "준비"}</button>
-          <button style={allReady ? S.btnPri : S.speed} onClick={onStart} disabled={!allReady}>시작</button>
+          <button style={allReady && isHost ? S.btnPri : S.speed} onClick={onStart} disabled={!allReady || !isHost}>시작</button>
         </div>
       </div>
     </div>
@@ -880,38 +1114,6 @@ function TabButton({ active, onClick, children }) {
     <button onClick={onClick} style={{ ...S.tab, ...(active ? S.tabOn : null) }}>
       {children}
     </button>
-  );
-}
-
-function MiniLineChart({ data, color = "#22c55e", h = 120 }) {
-  if (!data || data.length < 2) {
-    return <div style={{ ...S.muted, textAlign: "center", padding: 12 }}>데이터 수집 중...</div>;
-  }
-  const w = 120;
-  const H = 100;
-  const max = Math.max(...data);
-  const min = Math.min(...data);
-  const range = max - min || 1;
-  const pts = data
-    .map((v, i) => {
-      const x = (i / (data.length - 1)) * w;
-      const y = H - ((v - min) / range) * H;
-      return `${x},${y}`;
-    })
-    .join(" ");
-  const last = data[data.length - 1];
-  const first = data[0];
-  return (
-    <svg viewBox={`0 0 ${w} ${H}`} preserveAspectRatio="none" style={{ width: "100%", height: h, display: "block", background: "#0b1220", borderRadius: 10 }}>
-      {[15, 30, 45, 60, 75, 90].map((g) => (
-        <line key={g} x1="0" y1={g} x2={w} y2={g} stroke="#1f2937" strokeWidth="0.35" />
-      ))}
-      <polyline fill={`${color}22`} stroke="none" points={`${pts} ${w},${H} 0,${H}`} />
-      <polyline fill="none" stroke={color} strokeWidth="1.8" points={pts} />
-      <circle cx={w} cy={Math.max(0, Math.min(H, H - ((last - min) / range) * H))} r="1.5" fill={color} />
-      <text x="2" y="7.5" fill="#94a3b8" fontSize="4.3">시작 {fw(first)}</text>
-      <text x="72" y="7.5" fill={color} fontSize="4.3">현재 {fw(last)}</text>
-    </svg>
   );
 }
 
@@ -960,36 +1162,46 @@ function aggregateCandles(candles, tf) {
   return out.slice(-60);
 }
 
-function BinanceCandleChart({ candles, tf = "1D", h = 220 }) {
+function BinanceCandleChart({ candles, tf = "1D", h = 220, skin = "binance" }) {
   const data = aggregateCandles(candles, tf);
   if (!data || data.length < 2) {
     return <div style={{ ...S.muted, textAlign: "center", padding: 14 }}>차트 데이터 수집 중...</div>;
   }
+  const sk = CHART_SKINS[skin] || CHART_SKINS.binance;
   const W = 120;
-  const PLOT_R = 98;
-  const PLOT_L = 3;
-  const CH = 84;
+  const PLOT_R = 86;
+  const PLOT_L = 2;
+  const CH = 80;
   const vals = data.flatMap((c) => [c.h, c.l]);
   const max = Math.max(...vals);
   const min = Math.min(...vals);
   const range = max - min || 1;
   const py = (v) => CH - ((v - min) / range) * CH;
-  const candleW = Math.max(0.28, 78 / data.length);
+  const candleW = Math.max(0.2, 74 / data.length);
   const parse = (k) => {
     const [y, m, d] = String(k).split("-").map((v) => parseInt(v, 10));
     return { y: y || 0, m: m || 1, d: d || 1 };
   };
-  const labelStep = Math.max(1, Math.floor(data.length / 4));
+  const labelStep = Math.max(1, Math.floor(data.length / 6));
+  const yTicks = 6;
+  const xTicks = 6;
+  const last = data[data.length - 1];
+  const lastUp = last.c >= last.o;
+  const lastPx = fw(last.c * KRW_RATE);
   return (
-    <svg viewBox={`0 0 ${W} 100`} preserveAspectRatio="none" style={{ width: "100%", height: h, display: "block", background: "#0b1220", borderRadius: 10 }}>
-      {[18, 36, 54, 72].map((g) => (
-        <line key={g} x1="0" y1={g} x2={W} y2={g} stroke="#1f2937" strokeWidth="0.35" />
+    <svg viewBox={`0 0 ${W} 100`} preserveAspectRatio="none" style={{ width: "100%", height: h, display: "block", background: sk.bg, borderRadius: 10 }}>
+      {Array.from({ length: yTicks }, (_, i) => 8 + ((CH - 8) / (yTicks - 1)) * i).map((g) => (
+        <line key={`gy_${g}`} x1="0" y1={g} x2={W} y2={g} stroke={sk.grid} strokeWidth="0.32" />
       ))}
-      {[0, 1, 2, 3].map((i) => {
-        const val = min + ((3 - i) * range) / 3;
-        const yv = 18 + i * 18;
+      {Array.from({ length: xTicks }, (_, i) => i).map((i) => {
+        const x = PLOT_L + (PLOT_R / (xTicks - 1)) * i;
+        return <line key={`gx_${i}`} x1={x} y1="0" x2={x} y2={CH} stroke={sk.grid} strokeWidth="0.22" />;
+      })}
+      {Array.from({ length: yTicks }, (_, i) => i).map((i) => {
+        const val = min + ((yTicks - 1 - i) * range) / (yTicks - 1);
+        const yv = 8 + ((CH - 8) / (yTicks - 1)) * i;
         return (
-          <text key={`y_${i}`} x={W - 1.2} y={yv - 1.8} textAnchor="end" fill="#94a3b8" fontSize="2.8">
+          <text key={`y_${i}`} x={W - 1.1} y={yv - 0.8} textAnchor="end" fill={sk.text} fontSize="2.55">
             {fw(val * KRW_RATE)}
           </text>
         );
@@ -997,7 +1209,7 @@ function BinanceCandleChart({ candles, tf = "1D", h = 220 }) {
       {data.map((c, i) => {
         const x = PLOT_L + (i / data.length) * PLOT_R;
         const up = c.c >= c.o;
-        const col = up ? "#0ecb81" : "#f6465d";
+        const col = up ? sk.up : sk.down;
         const yH = py(c.h);
         const yL = py(c.l);
         const yO = py(c.o);
@@ -1006,16 +1218,24 @@ function BinanceCandleChart({ candles, tf = "1D", h = 220 }) {
         const bodyH = Math.max(0.7, Math.abs(yO - yC));
         return (
           <g key={c.k}>
-            <line x1={x + candleW / 2} y1={yH} x2={x + candleW / 2} y2={yL} stroke={col} strokeWidth="0.4" />
+            <line x1={x + candleW / 2} y1={yH} x2={x + candleW / 2} y2={yL} stroke={col} strokeWidth={Math.max(0.3, candleW * 0.16)} />
             <rect x={x} y={yTop} width={candleW} height={bodyH} fill={col} />
             {i % labelStep === 0 && (() => {
               const dt = parse(c.k);
               const label = tf === "1M" ? `${String(dt.y).slice(2)}.${String(dt.m).padStart(2, "0")}` : `${dt.m}/${dt.d}`;
-              return <text x={x} y="97.6" fill="#cbd5e1" fontSize="3.2">{label}</text>;
+              return <text x={x} y="97.2" fill={sk.text} fontSize="2.85">{label}</text>;
             })()}
           </g>
         );
       })}
+      <text x={W * 0.5} y={CH * 0.58} textAnchor="middle" fill={sk.text} opacity="0.08" fontSize="9.2" fontWeight="800">
+        {sk.watermark}
+      </text>
+      <line x1={0} y1={py(last.c)} x2={W} y2={py(last.c)} stroke={lastUp ? sk.up : sk.down} strokeWidth="0.28" strokeDasharray="1.6 1.4" opacity="0.8" />
+      <rect x={W - 24} y={py(last.c) - 3.1} width="23.2" height="5.2" rx="1.2" fill={lastUp ? `${sk.up}22` : `${sk.down}22`} stroke={lastUp ? sk.up : sk.down} strokeWidth="0.24" />
+      <text x={W - 12.2} y={py(last.c) + 0.8} textAnchor="middle" fill={lastUp ? sk.up : sk.down} fontSize="2.35" fontWeight="700">
+        {lastPx}
+      </text>
     </svg>
   );
 }
@@ -1027,13 +1247,12 @@ export default function App() {
   const [run, setRun] = useState(false);
   const [spd, setSpd] = useState(1);
   const [tab, setTab] = useState("trade");
-  const [toast, setToast] = useState("");
+  const [toast, setToastRaw] = useState(null);
   const [eventModal, setEventModal] = useState(null);
   const [lastRank, setLastRank] = useState(null);
   const [G, setG] = useState(null);
   const [savedGame, setSavedGame] = useState(null);
   const [btcHist, setBtcHist] = useState([]);
-  const [wealthHist, setWealthHist] = useState([]);
   const [sfxMuted, setSfxMuted] = useState(false);
   const [multi, setMulti] = useState(null);
   const [players, setPlayers] = useState([]);
@@ -1042,6 +1261,7 @@ export default function App() {
   const [cmdQty, setCmdQty] = useState({});
   const [inspectRivalId, setInspectRivalId] = useState(null);
   const [chartTf, setChartTf] = useState("1D");
+  const [chartSkin, setChartSkin] = useState("binance");
   const [dateFx, setDateFx] = useState(null);
   const [spotForm, setSpotForm] = useState({
     side: "buy",
@@ -1061,6 +1281,8 @@ export default function App() {
   const [depWdPct, setDepWdPct] = useState(25);
   const [selectedTagId, setSelectedTagId] = useState(null);
   const [selectedCollectibleId, setSelectedCollectibleId] = useState(null);
+  const [roomState, setRoomState] = useState(null);
+  const [unlockFx, setUnlockFx] = useState(null);
 
   const btcKrw = useMemo(() => (G ? G.btcUsd * KRW_RATE : 0), [G]);
   const rivalBoard = useMemo(() => {
@@ -1077,11 +1299,28 @@ export default function App() {
     }));
   }, [G]);
 
+  const toastPush = useCallback((msg, level = "info", priority = 1) => {
+    if (!msg) return;
+    setToastRaw((prev) => {
+      const now = Date.now();
+      if (prev && prev.msg === msg && now - prev.ts < 1400) return prev;
+      if (prev && (prev.priority || 0) > priority && now - prev.ts < 900) return prev;
+      return { msg, level, priority, ts: now };
+    });
+  }, []);
+
   useEffect(() => {
-    if (!toast) return;
-    const id = setTimeout(() => setToast(""), 1800);
+    if (!toast?.msg) return;
+    const ttl = toast.level === "warn" ? 2600 : toast.level === "bad" ? 2800 : 2000;
+    const id = setTimeout(() => setToastRaw(null), ttl);
     return () => clearTimeout(id);
   }, [toast]);
+
+  useEffect(() => {
+    if (!unlockFx) return;
+    const id = setTimeout(() => setUnlockFx(null), 2100);
+    return () => clearTimeout(id);
+  }, [unlockFx]);
 
   const sendWs = (msg) => {
     const ws = wsRef.current;
@@ -1113,6 +1352,7 @@ export default function App() {
       }
       if (!m) return;
       if (m.type === "room_state" && m.room) {
+        setRoomState(m.room);
         setPlayers(
           (m.room.players || []).map((p) => ({
             id: p.id,
@@ -1128,8 +1368,17 @@ export default function App() {
             roi: 0,
           })),
         );
+        if (multi?.customMode) {
+          if (typeof m.room.speed === "number") setSpd(m.room.speed);
+          setG((prev) => (prev ? { ...prev, endYear: m.room.endYear || prev.endYear, pauseLimit: m.room.pauseLimit || prev.pauseLimit } : prev));
+        }
       }
       if (m.type === "start_game") {
+        if (m.room) {
+          setRoomState(m.room);
+          if (typeof m.room.speed === "number") setSpd(m.room.speed);
+          setG((prev) => (prev ? { ...prev, endYear: m.room.endYear || prev.endYear, pauseLimit: m.room.pauseLimit || prev.pauseLimit } : prev));
+        }
         setScreen("game");
         setPausedBy(null);
         setRun(true);
@@ -1141,6 +1390,14 @@ export default function App() {
       if (m.type === "resume_game") {
         setPausedBy(null);
         setRun(true);
+      }
+      if (m.type === "kicked") {
+        toastPush("방장에서 강퇴되었습니다", "bad", 3);
+        setRun(false);
+        setScreen("setup");
+        setMulti(null);
+        setPlayers([]);
+        setRoomState(null);
       }
     };
     ws.onclose = () => {
@@ -1165,17 +1422,38 @@ export default function App() {
     setBtcHist((prev) => {
       const last = prev[prev.length - 1];
       if (last && last.k === key && last.c === G.btcUsd) return prev;
-      const o = last ? last.c : G.btcPrev || G.btcUsd;
+      const prevClose = last ? last.c : G.btcPrev || G.btcUsd;
+      const gSeed = G.gameSeed || 1;
+      const gapSeed = gaussian(gSeed, "gap", G.year, G.month, G.day);
+      const gap = clamp(gapSeed * (G.btcVol || 0.02) * 0.12, -0.06, 0.06);
+      const o = prevClose * (1 + gap);
       const c = G.btcUsd;
-      const wave = 0.003 + Math.abs(Math.sin((G.year * 1000 + G.month * 40 + G.day) * 0.17)) * 0.01;
-      const h = Math.max(o, c) * (1 + wave);
-      const l = Math.min(o, c) * (1 - wave);
+      const baseVol = clamp((G.btcVol || 0.02) * (0.85 + Math.abs(gaussian(gSeed, "iv", G.year, G.month, G.day)) * 0.65), 0.004, 0.22);
+      let hi = Math.max(o, c);
+      let lo = Math.min(o, c);
+      const steps = 18;
+      let px = o;
+      for (let i = 1; i <= steps; i++) {
+        const t = i / steps;
+        const target = o + (c - o) * t;
+        const nz = studentLike(gSeed, "intra", G.year, G.month, G.day, i);
+        px += (target - px) * 0.42 + nz * baseVol * o * 0.22;
+        hi = Math.max(hi, px);
+        lo = Math.min(lo, px);
+      }
+      // Occasional extra wick spikes to create hammer/inverted/doji-like variety.
+      const spikeRoll = rand01(gSeed, "spike", G.year, G.month, G.day);
+      if (spikeRoll < 0.17) {
+        hi *= 1 + baseVol * (0.25 + rand01(gSeed, "spikeU", G.year, G.month, G.day) * 1.8);
+      } else if (spikeRoll < 0.34) {
+        lo *= 1 - baseVol * (0.25 + rand01(gSeed, "spikeD", G.year, G.month, G.day) * 1.8);
+      } else if (spikeRoll < 0.42) {
+        hi *= 1 + baseVol * (0.18 + rand01(gSeed, "spikeU2", G.year, G.month, G.day) * 1.1);
+        lo *= 1 - baseVol * (0.18 + rand01(gSeed, "spikeD2", G.year, G.month, G.day) * 1.1);
+      }
+      const h = Math.max(Math.max(o, c), hi);
+      const l = Math.max(1000, Math.min(Math.min(o, c), lo));
       return [...prev.slice(-239), { k: key, o, h, l, c }];
-    });
-    setWealthHist((prev) => {
-      const last = prev[prev.length - 1];
-      if (last && last.k === key && last.v === G.total) return prev;
-      return [...prev.slice(-239), { k: key, v: G.total }];
     });
   }, [G, screen]);
 
@@ -1211,7 +1489,7 @@ export default function App() {
 
         if (y > (p.endYear || 2041)) {
           setRun(false);
-          setToast(`${p.endYear || 2041}년 게임 종료`);
+          toastPush(`${p.endYear || 2041}년 게임 종료`, "warn", 2);
           return p;
         }
         const monthChanged = m !== prevM || y !== prevY;
@@ -1221,32 +1499,9 @@ export default function App() {
           setTimeout(() => setDateFx(null), 1200);
         }
 
-        let btcUsd = getBtcUsd(y, m, d);
         const sig = marketSignal(p.gameSeed || 1, y, m, d, p.scenario || makeScenario(p.gameSeed || 1));
         const macro = p.activeMacro;
         const macroMul = macro ? { btc: macro.btc || 0, eq: macro.eq || 0, re: macro.re || 0 } : { btc: 0, eq: 0, re: 0 };
-        btcUsd *= 1 + sig.btc + macroMul.btc;
-        const ev = EVENTS.find((e) => e.y === y && e.m === m && e.d === d);
-        if (ev && !p.doneEvents.includes(`${ev.y}-${ev.m}-${ev.d}`)) {
-          btcUsd *= 1 + ev.shock;
-          setEventModal({ ev });
-          setRun(false);
-          stats.eventCount += 1;
-          if (!sfxMuted) beep(ev.et === "crash" ? 220 : 880, 0.06, 0.15, ev.et === "crash" ? "sawtooth" : "sine");
-        }
-        let rareEv = null;
-        if (d === 1) {
-          const roll = (h32(p.gameSeed || 1, y, m, "rare") / 0xffffffff);
-          const candidate = RARE_EVENTS.find((r2) => roll < r2.chance);
-          if (candidate && !(p.newsLog || []).some((n) => n.id === candidate.id && n.y === y && n.m === m)) {
-            rareEv = candidate;
-            btcUsd *= 1 + candidate.btc;
-            setEventModal({ ev: { e: `⚠ 레어 이벤트: ${candidate.name}`, et: "rare" } });
-            setRun(false);
-            stats.eventCount += 1;
-            stats.rareEventSurvived += 1;
-          }
-        }
         let marketPhase = p.marketPhase || null;
         if (d === 1) {
           if (marketPhase?.leftMonths > 0) {
@@ -1263,7 +1518,7 @@ export default function App() {
             } else if (roll < 0.24) {
               marketPhase = { id: "deep_bear", name: "대폭락장", btc: -0.022, eq: -0.012, re: -0.006, leftMonths: 5 + Math.floor((roll * 100) % 5) };
             }
-            if (marketPhase) setToast(`시장 레짐 전환: ${marketPhase.name}`);
+            if (marketPhase) toastPush(`시장 레짐 전환: ${marketPhase.name}`);
           }
         }
         const hawkish = Math.max(0, getFedRate(y, m) - 4.25);
@@ -1273,8 +1528,139 @@ export default function App() {
           re: -0.0012 * hawkish,
         };
         const phasePenalty = marketPhase ? { btc: marketPhase.btc, eq: marketPhase.eq, re: marketPhase.re } : { btc: 0, eq: 0, re: 0 };
-        btcUsd *= Math.max(0.78, 1 + phasePenalty.btc + ratePenalty.btc);
-        btcUsd = Math.max(9000, btcUsd);
+        const prevRet = p.btcPrevRet || 0;
+        const prevVol = p.btcVol || 0.028;
+        const prevEps = p.btcEps || 0;
+        const prevTrend = p.btcTrend || 0;
+        let btcRegime = p.btcRegime || "chop";
+        let btcRegimeLeft = p.btcRegimeLeft || 0;
+        let btcBlockStart = p.btcBlockStart || 0;
+        let btcBlockOffset = p.btcBlockOffset || 0;
+        let btcBlockRemain = p.btcBlockRemain || 0;
+        const regimeTransition = {
+          chop: [
+            ["chop", 0.91], ["bull", 0.035], ["bear", 0.04], ["panic", 0.008], ["squeeze", 0.007],
+          ],
+          bull: [
+            ["bull", 0.93], ["chop", 0.04], ["squeeze", 0.016], ["bear", 0.01], ["panic", 0.004],
+          ],
+          bear: [
+            ["bear", 0.935], ["chop", 0.045], ["panic", 0.014], ["bull", 0.004], ["squeeze", 0.002],
+          ],
+          panic: [
+            ["panic", 0.78], ["bear", 0.16], ["chop", 0.05], ["bull", 0.005], ["squeeze", 0.005],
+          ],
+          squeeze: [
+            ["squeeze", 0.8], ["bull", 0.13], ["chop", 0.05], ["bear", 0.01], ["panic", 0.01],
+          ],
+        };
+        if (btcRegimeLeft <= 0) {
+          const tr = regimeTransition[btcRegime] || regimeTransition.chop;
+          const u = rand01(p.gameSeed || 1, "btc_regime", y, m, d);
+          let acc = 0;
+          let nextReg = tr[0][0];
+          for (let i = 0; i < tr.length; i++) {
+            acc += tr[i][1];
+            if (u <= acc) { nextReg = tr[i][0]; break; }
+          }
+          btcRegime = nextReg;
+          const durMap = { chop: [3, 45], bear: [6, 55], bull: [5, 44], panic: [2, 12], squeeze: [2, 10] };
+          const [lo, hi] = durMap[btcRegime] || [2, 16];
+          btcRegimeLeft = lo + Math.floor(rand01(p.gameSeed || 1, "btc_regime_dur", y, m, d) * (hi - lo + 1));
+        } else {
+          btcRegimeLeft -= 1;
+        }
+        const reg = {
+          chop: { drift: 0.0, volMul: 0.86, phi: 0.08, scale: 0.95, jumpExtra: 0.0 },
+          bear: { drift: -0.0010, volMul: 1.16, phi: 0.17, scale: 1.06, jumpExtra: 0.004 },
+          bull: { drift: 0.00085, volMul: 1.04, phi: 0.15, scale: 1.02, jumpExtra: 0.002 },
+          panic: { drift: -0.0023, volMul: 1.42, phi: 0.23, scale: 1.18, jumpExtra: 0.009 },
+          squeeze: { drift: 0.0021, volMul: 1.35, phi: 0.21, scale: 1.16, jumpExtra: 0.009 },
+        }[btcRegime] || { drift: 0, volMul: 1, phi: 0.1, scale: 1, jumpExtra: 0 };
+        // GARCH-like volatility update calibrated to real BTC daily return stats (2019+).
+        const omega = 0.000018;
+        const alpha = 0.19;
+        const beta = 0.79;
+        const prevVar = Math.max(0.00003, prevVol * prevVol);
+        const newVar = clamp(omega + alpha * prevRet * prevRet + beta * prevVar, 0.00002, 0.07);
+        const btcVol = clamp(Math.sqrt(newVar) * reg.volMul, 0.008, 0.11);
+        // Slowly varying latent trend and persistence without deterministic wave patterns.
+        const trendNoise = gaussian(p.gameSeed || 1, "btc_trend", y, m, d) * 0.00032;
+        const btcTrend = clamp(prevTrend * 0.989 + trendNoise + reg.drift * 0.07, -0.0052, 0.0052);
+
+        // Empirical block bootstrap from real BTC daily returns.
+        if (btcBlockRemain <= 0) {
+          const bucket = btcRegime === "bull" ? BTC_RET_BUCKETS.bull : btcRegime === "bear" || btcRegime === "panic" ? BTC_RET_BUCKETS.bear : BTC_RET_BUCKETS.chop;
+          const pick = bucket[Math.floor(rand01(p.gameSeed || 1, "btc_block_start", y, m, d) * bucket.length)] ?? 0;
+          const lenMap = { chop: [4, 30], bull: [5, 24], bear: [6, 28], panic: [2, 8], squeeze: [2, 7] };
+          const [lo, hi] = lenMap[btcRegime] || [4, 20];
+          const bl = lo + Math.floor(rand01(p.gameSeed || 1, "btc_block_len", y, m, d) * (hi - lo + 1));
+          btcBlockStart = pick;
+          btcBlockOffset = 0;
+          btcBlockRemain = bl;
+        } else {
+          btcBlockOffset += 1;
+          btcBlockRemain -= 1;
+        }
+        const srcIdx = (btcBlockStart + btcBlockOffset) % BTC_RET_REAL.length;
+        const empiricalRet = BTC_RET_REAL[srcIdx] || 0;
+        const empiricalScaled = empiricalRet * reg.scale;
+
+        // Residual heavy-tail shock (small), keeps unpredictability without absurd 40% daily jumps.
+        const tail = studentLike(p.gameSeed || 1, "btc_tail", y, m, d) * btcVol * 0.35;
+        const eps = clamp(prevEps * 0.35 + tail, -0.12, 0.12);
+        const drift = reg.drift + (p.scenario?.btcBias || 0) * 0.08 + macroMul.btc * 0.22 + phasePenalty.btc * 0.25 + ratePenalty.btc * 0.55 + btcTrend;
+        const ar = clamp(prevRet * reg.phi, -0.08, 0.08);
+        const jRoll = rand01(p.gameSeed || 1, "btc_jump", y, m, d);
+        const jProb = clamp(0.003 + btcVol * 0.09 + reg.jumpExtra, 0.003, 0.035);
+        const jMagSeed = rand01(p.gameSeed || 1, "btc_jump_mag", y, m, d);
+        const dirSeed = gaussian(p.gameSeed || 1, "btc_jump_dir", y, m, d);
+        const dirBias = (btcRegime === "bear" ? -0.35 : 0) + (btcRegime === "panic" ? -0.55 : 0) + (btcRegime === "bull" ? 0.28 : 0) + (btcRegime === "squeeze" ? 0.45 : 0);
+        const jDir = (dirSeed + dirBias) >= 0 ? 1 : -1;
+        const jump = jRoll < jProb ? jDir * (0.018 + Math.pow(jMagSeed, 0.72) * 0.06) : 0;
+        const dailyRet = clamp(empiricalScaled + drift + ar + eps + jump, -0.18, 0.18);
+        let btcUsd = Math.max(7000, p.btcUsd * (1 + dailyRet));
+        const ev = EVENTS.find((e) => e.y === y && e.m === m && e.d === d);
+        if (ev && !p.doneEvents.includes(`${ev.y}-${ev.m}-${ev.d}`)) {
+          btcUsd *= Math.max(0.2, 1 + ev.shock);
+          setEventModal({ ev });
+          setRun(false);
+          stats.eventCount += 1;
+          if (!sfxMuted) beep(ev.et === "crash" ? 220 : 880, 0.06, 0.15, ev.et === "crash" ? "sawtooth" : "sine");
+        }
+        let rareEv = null;
+        let memeEv = null;
+        if (d === 1) {
+          const roll = h32(p.gameSeed || 1, y, m, "rare") / 0xffffffff;
+          const candidate = RARE_EVENTS.find((r2) => roll < r2.chance);
+          if (candidate && !(p.newsLog || []).some((n) => n.id === candidate.id && n.y === y && n.m === m)) {
+            rareEv = candidate;
+            btcUsd *= Math.max(0.15, 1 + candidate.btc);
+            setEventModal({ ev: { e: `⚠ 레어 이벤트: ${candidate.name}`, et: "rare" } });
+            setRun(false);
+            stats.eventCount += 1;
+            stats.rareEventSurvived += 1;
+          }
+          if (!rareEv) {
+            const roll2 = h32(p.gameSeed || 1, y, m, "meme") / 0xffffffff;
+            let acc2 = 0;
+            for (let i = 0; i < MEME_EVENTS.length; i++) {
+              acc2 += MEME_EVENTS[i].chance;
+              if (roll2 <= acc2) {
+                memeEv = MEME_EVENTS[i];
+                break;
+              }
+            }
+            if (memeEv && !(p.newsLog || []).some((n) => n.id === memeEv.id && n.y === y && n.m === m)) {
+              btcUsd *= Math.max(0.78, 1 + memeEv.btc);
+              stats.eventCount += 1;
+              toastPush(`밈 이벤트: ${memeEv.name}`, "warn", 1);
+              if (!sfxMuted) beep(memeEv.btc >= 0 ? 980 : 240, 0.04, 0.08, memeEv.btc >= 0 ? "triangle" : "square");
+            } else {
+              memeEv = null;
+            }
+          }
+        }
 
         let cash = p.cash;
         let btc = p.btc;
@@ -1282,7 +1668,7 @@ export default function App() {
         if (d === 1) {
           cash += MONTHLY_SALARY;
           monthlyIncome += MONTHLY_SALARY;
-          setToast(`월급 ${fw(MONTHLY_SALARY)} 입금`);
+          toastPush(`월급 ${fw(MONTHLY_SALARY)} 입금`);
           stats.monthsAlive += 1;
           if (btc > 0) stats.btcHoldMonths += 1;
           if (!sfxMuted) beep(1040, 0.05, 0.09, "triangle");
@@ -1326,7 +1712,7 @@ export default function App() {
           if (monthlyDiv > 0) {
             cash += monthlyDiv;
             monthlyIncome += monthlyDiv;
-            setToast(`월배당 ${fw(monthlyDiv)} 입금`);
+            toastPush(`월배당 ${fw(monthlyDiv)} 입금`);
             if (!sfxMuted) beep(1320, 0.04, 0.08, "triangle");
           }
         }
@@ -1339,9 +1725,9 @@ export default function App() {
             commodities.reduce((sum, c) => sum + c.cur * c.qty, 0);
           const board = buildRivalBoard(p.startCash, y, m, btcUsd, currentTotal, p.gameSeed || 1);
           setLastRank({ y, m, rank: board.myRank, total: board.all.length, point: 0 });
-          setToast(`분기 ${board.myRank}위`);
+          toastPush(`분기 ${board.myRank}위`);
           setRankInspectId(null);
-          setRankModal({ y, m, rank: board.myRank, total: board.all.length, point: 0, rows: board.all.slice(0, 8) });
+          setRankModal({ y, m, rank: board.myRank, total: board.all.length, point: 0, rows: board.all.slice(0, 6) });
           setRun(false);
         }
 
@@ -1363,14 +1749,14 @@ export default function App() {
               btc += q;
               cash -= od.amountKrw;
               stats.spotTrades += 1;
-              setToast(`지정가 매수 체결 ${q.toFixed(4)} BTC`);
+              toastPush(`지정가 매수 체결 ${q.toFixed(4)} BTC`);
             }
           } else if (btc > 0) {
             const q = Math.min(btc, od.qtyBtc);
             btc -= q;
             cash += q * btcUsd * KRW_RATE;
             stats.spotTrades += 1;
-            setToast(`지정가 매도 체결 ${q.toFixed(4)} BTC`);
+            toastPush(`지정가 매도 체결 ${q.toFixed(4)} BTC`);
           }
         });
         spotOrders = remainSpot;
@@ -1396,7 +1782,7 @@ export default function App() {
               takeProfit: od.takeProfit,
             });
             cash -= od.margin;
-            setToast(`선물 지정가 ${od.side === "long" ? "롱" : "숏"} 체결`);
+            toastPush(`선물 지정가 ${od.side === "long" ? "롱" : "숏"} 체결`);
           }
         });
         futOrders = remainFutOrders;
@@ -1415,7 +1801,7 @@ export default function App() {
             stats.futClosed += 1;
             stats.stopLossHits += 1;
             stats.bestFutRoi = Math.max(stats.bestFutRoi, r * f.lev * 100);
-            setToast("선물 스탑로스 발동");
+            toastPush("선물 스탑로스 발동");
             return false;
           }
           if (tpHit) {
@@ -1424,12 +1810,12 @@ export default function App() {
             cash += Math.max(0, f.margin + pnl);
             stats.futClosed += 1;
             stats.bestFutRoi = Math.max(stats.bestFutRoi, r * f.lev * 100);
-            setToast("선물 테이크프로핏 체결");
+            toastPush("선물 테이크프로핏 체결");
             return false;
           }
           const liq = f.side === "long" ? btcUsd <= f.liq : btcUsd >= f.liq;
           if (liq) {
-            setToast("선물 포지션 강제청산");
+            toastPush("선물 포지션 강제청산");
             stats.liqHits += 1;
             if (!sfxMuted) beep(180, 0.08, 0.14, "square");
           }
@@ -1452,7 +1838,7 @@ export default function App() {
           const avgLoanRate = loanRate > 0 ? loanRate : 4.5;
           let reducePrincipalNeed = ((monthlyLoanInterest - monthlyIncome) * 12) / (avgLoanRate / 100);
           if (reducePrincipalNeed > 0) {
-            setToast("경고: 이자>월현금흐름, 자동 담보청산 실행");
+            toastPush("경고: 이자>월현금흐름, 자동 담보청산 실행", "warn", 2);
             // 0) 원자재
             for (let i = 0; i < commodities.length && reducePrincipalNeed > 0; i++) {
               const c = commodities[i];
@@ -1649,7 +2035,7 @@ export default function App() {
             if (loans[i].principal <= 0) loans.splice(i, 1);
           }
           loanVal = loans.reduce((sum, l) => sum + l.principal, 0);
-          setToast("담보가치 하락: 자동 담보 청산/상환");
+          toastPush("담보가치 하락: 자동 담보 청산/상환", "warn", 2);
           if (!sfxMuted) beep(260, 0.07, 0.1, "square");
         }
 
@@ -1667,7 +2053,7 @@ export default function App() {
         if (Math.abs(sig.btc) >= 0.01) stats.highVolSurvived = true;
         if (total <= 0) {
           setRun(false);
-          setToast("파산: 게임 탈락");
+          toastPush("파산: 게임 탈락", "bad", 3);
         }
 
         const next = {
@@ -1677,6 +2063,15 @@ export default function App() {
           day: d,
           btcPrev: p.btcUsd,
           btcUsd,
+          btcPrevRet: dailyRet,
+          btcVol,
+          btcEps: eps,
+          btcTrend,
+          btcRegime,
+          btcRegimeLeft,
+          btcBlockStart,
+          btcBlockOffset,
+          btcBlockRemain,
           cash,
           btc,
           deposits,
@@ -1706,6 +2101,9 @@ export default function App() {
         } else {
           next.newsLog = p.newsLog || [];
         }
+        if (memeEv) {
+          next.newsLog = [...(next.newsLog || []), { id: memeEv.id, title: memeEv.name, y, m, d, et: "meme" }];
+        }
 
         if (ev) {
           next.doneEvents = [...next.doneEvents, `${ev.y}-${ev.m}-${ev.d}`];
@@ -1715,8 +2113,23 @@ export default function App() {
         const unlocked = evaluateUnlocks(next);
         next.ownedTags = unlocked.ownedTags;
         next.collection = unlocked.collection;
-        if (unlocked.tagsUnlocked.length > 0) setToast(`새 태그 획득: ${unlocked.tagsUnlocked[0].icon} ${unlocked.tagsUnlocked[0].name}`);
-        if (unlocked.collUnlocked.length > 0) setToast(`수집 해금: ${unlocked.collUnlocked[0].icon} ${unlocked.collUnlocked[0].name}`);
+        if (unlocked.tagsUnlocked.length > 0) {
+          const t = unlocked.tagsUnlocked[0];
+          const ts = TAG_TIER_STYLE[t.tier] || TAG_TIER_STYLE.common;
+          toastPush(`새 태그 획득: ${t.icon} ${t.name}`, "good", 2);
+          setUnlockFx({ msg: `태그 해금 · ${t.icon} ${t.name}`, color: ts.color, tier: t.tier });
+        }
+        if (unlocked.collUnlocked.length > 0) {
+          const c = unlocked.collUnlocked[0];
+          const cc = c.rarity === "전설" ? "#c084fc" : c.rarity === "레어" ? "#22c55e" : "#94a3b8";
+          toastPush(`수집 해금: ${c.icon} ${c.name}`, "good", 2);
+          setUnlockFx({ msg: `도감 등록 · ${c.icon} ${c.name}`, color: cc, tier: c.rarity === "전설" ? "legendary" : c.rarity === "레어" ? "epic" : "common" });
+        }
+        if (next.ownedTags.length >= TAG_DEFS.length && next.collection.length >= COLLECTIBLES.length && !next.codexCrown) {
+          next.codexCrown = true;
+          toastPush("도감 100% 달성: 오버클록 수집가 칭호 해금", "good", 3);
+          setUnlockFx({ msg: "🏆 도감 완성! 오버클록 수집가", color: "#c084fc", tier: "legendary" });
+        }
 
         if (multi?.enabled) {
           if (multi?.customMode) {
@@ -1754,10 +2167,9 @@ export default function App() {
           setMulti(g2.multi || null);
           setPlayers(g2.players || []);
           setBtcHist([{ k: `${g2.year}-${g2.month}-${g2.day}`, o: g2.btcPrev || g2.btcUsd, h: g2.btcUsd, l: g2.btcUsd, c: g2.btcUsd }]);
-          setWealthHist([{ k: `${g2.year}-${g2.month}-${g2.day}`, v: g2.total }]);
           setScreen("game");
         }}
-        onStart={({ startCash, mode, nickname, endYear, pauseLimit, fillBots, customMode, roomCode, serverUrl }) => {
+        onStart={({ startCash, mode, nickname, endYear, pauseLimit, fillBots, customMode, roomCode }) => {
           const gameSeed = (Date.now() ^ Math.floor(Math.random() * 0xffffffff)) >>> 0;
           const bp = getBtcUsd(2026, 3, 11);
           const baseGame = normalizeGame({
@@ -1787,7 +2199,7 @@ export default function App() {
             collection: [],
             doneEvents: [],
             total: startCash,
-            multi: mode === "multi" ? { enabled: true, nickname, fillBots, customMode, roomCode, serverUrl, pauseLimit } : null,
+            multi: mode === "multi" ? { enabled: true, nickname, fillBots, customMode, roomCode, serverUrl: DEFAULT_WS_URL, pauseLimit } : null,
             players: [],
           });
           setG(baseGame);
@@ -1795,15 +2207,16 @@ export default function App() {
             const me = { id: clientIdRef.current, nickname, icon: "🎮", isHost: true, pauseLeft: pauseLimit, isBot: false, ready: false, cash: startCash, btc: 0, total: startCash, roi: 0 };
             const bots = fillBots ? makeBots(customMode ? 0 : 5, startCash).map((b) => ({ ...b, pauseLeft: 0 })) : [];
             setPlayers([me, ...bots]);
-            setMulti({ enabled: true, nickname, fillBots, customMode, pauseLimit, roomCode, serverUrl });
+            setMulti({ enabled: true, nickname, fillBots, customMode, pauseLimit, roomCode, serverUrl: DEFAULT_WS_URL });
+            setRoomState({ endYear, pauseLimit, speed: 1, players: [me, ...bots], hostId: me.id });
             setScreen("lobby");
           } else {
             setPlayers([]);
             setMulti(null);
+            setRoomState(null);
             setScreen("game");
           }
           setBtcHist([{ k: "2026-3-11", o: bp, h: bp, l: bp, c: bp }]);
-          setWealthHist([{ k: "2026-3-11", v: startCash }]);
         }}
       />
     );
@@ -1813,10 +2226,12 @@ export default function App() {
     return (
       <Lobby
         players={players}
+        roomState={roomState}
         onBack={() => {
           setScreen("setup");
           setMulti(null);
           setPlayers([]);
+          setRoomState(null);
         }}
         onReady={() => {
           if (multi?.customMode) {
@@ -1834,6 +2249,23 @@ export default function App() {
           setPlayers((p) => p.map((x) => (x.id === clientIdRef.current ? { ...x, ready: true } : x)));
           setRun(true);
           setScreen("game");
+        }}
+        onApplySettings={({ endYear, pauseLimit, speed }) => {
+          if (multi?.customMode) {
+            sendWs({ type: "update_settings", endYear, pauseLimit, speed });
+            return;
+          }
+          setPlayers((p) => p.map((x) => ({ ...x, pauseLeft: Math.min(x.pauseLeft ?? pauseLimit, pauseLimit) })));
+          setG((prev) => (prev ? { ...prev, endYear, pauseLimit } : prev));
+          setSpd(speed || 1);
+          setRoomState((rs) => ({ ...(rs || {}), endYear, pauseLimit, speed }));
+        }}
+        onKick={(targetId) => {
+          if (multi?.customMode) {
+            sendWs({ type: "kick", targetId });
+            return;
+          }
+          setPlayers((p) => p.filter((x) => x.id !== targetId));
         }}
       />
     );
@@ -1871,14 +2303,14 @@ export default function App() {
           const amount = totalByInput;
           const q = qtyByInput;
           if (amount <= 0 || q <= 0 || amount > p.cash) return p;
-          setToast(`시장가 매수 ${q.toFixed(4)} BTC`);
+          toastPush(`시장가 매수 ${q.toFixed(4)} BTC`);
           const stats = ensureStats(p.stats, p.startCash);
           stats.spotTrades += 1;
           return { ...p, cash: p.cash - amount, btc: p.btc + q, stats };
         }
         const q = qtyByInput;
         if (q <= 0 || q > p.btc) return p;
-        setToast(`시장가 매도 ${q.toFixed(4)} BTC`);
+        toastPush(`시장가 매도 ${q.toFixed(4)} BTC`);
         const stats = ensureStats(p.stats, p.startCash);
         stats.spotTrades += 1;
         return { ...p, btc: p.btc - q, cash: p.cash + q * orderPx, stats };
@@ -1894,7 +2326,7 @@ export default function App() {
           ? { id: `s_${Date.now()}`, side, priceKrw: px, amountKrw: totalByInput, qtyBtc: qtyByInput }
           : { id: `s_${Date.now()}`, side, priceKrw: px, qtyBtc: qtyByInput, amountKrw: totalByInput };
       if ((od.amountKrw || od.qtyBtc || 0) <= 0) return p;
-      setToast("현물 지정가 주문 접수");
+      toastPush("현물 지정가 주문 접수");
       return { ...p, spotOrders: [...(p.spotOrders || []), od] };
     });
   };
@@ -1904,7 +2336,7 @@ export default function App() {
     const type = futForm.type;
     const levRaw = Math.floor(num(futForm.lev) || 0);
     if (levRaw < 2 || levRaw > 25) {
-      setToast("레버리지는 2x~25x로 입력");
+      toastPush("레버리지는 2x~25x로 입력", "warn", 2);
       return;
     }
     const lev = clamp(levRaw, 2, 25);
@@ -1919,7 +2351,7 @@ export default function App() {
         const liq = side === "long" ? entry * (1 - 0.9 / lev) : entry * (1 + 0.9 / lev);
         const stopLoss = stopPct > 0 ? (side === "long" ? entry * (1 - stopPct / 100) : entry * (1 + stopPct / 100)) : null;
         const takeProfit = tpPct > 0 ? (side === "long" ? entry * (1 + tpPct / 100) : entry * (1 - tpPct / 100)) : null;
-        setToast(`선물 ${side === "long" ? "롱" : "숏"} ${lev}x 진입`);
+        toastPush(`선물 ${side === "long" ? "롱" : "숏"} ${lev}x 진입`);
         return { ...p, cash: p.cash - margin, futures: [...p.futures, { side, lev, margin, entry, liq, stopLoss, takeProfit }] };
       });
       return;
@@ -1931,7 +2363,7 @@ export default function App() {
       const stopLoss = stopPct > 0 ? (side === "long" ? (px / KRW_RATE) * (1 - stopPct / 100) : (px / KRW_RATE) * (1 + stopPct / 100)) : null;
       const takeProfit = tpPct > 0 ? (side === "long" ? (px / KRW_RATE) * (1 + tpPct / 100) : (px / KRW_RATE) * (1 - tpPct / 100)) : null;
       const od = { id: `f_${Date.now()}`, side, lev, margin, priceKrw: px, stopLoss, takeProfit };
-      setToast("선물 지정가 주문 접수");
+      toastPush("선물 지정가 주문 접수");
       return { ...p, futOrders: [...(p.futOrders || []), od] };
     });
   };
@@ -1946,7 +2378,7 @@ export default function App() {
       const stats = ensureStats(p.stats, p.startCash);
       stats.futClosed += 1;
       stats.bestFutRoi = Math.max(stats.bestFutRoi, r * f.lev * 100);
-      setToast(`선물 청산 ${fw(pnl)}`);
+      toastPush(`선물 청산 ${fw(pnl)}`);
       return { ...p, cash: p.cash + refund, futures: p.futures.filter((_, i) => i !== idx), stats };
     });
   };
@@ -1979,11 +2411,72 @@ export default function App() {
     { k: "현재 시장 레짐", v: G.marketPhase?.name || "중립", c: G.marketPhase ? "#f59e0b" : "#94a3b8", d: G.marketPhase ? `${G.marketPhase.leftMonths}개월 남음` : "레짐 없음" },
     { k: "레어 이벤트 위험도", v: `${((RARE_EVENTS.reduce((s, x) => s + x.chance, 0)) * 100).toFixed(2)}%/월`, c: "#c084fc", d: "대공황/핵전쟁 포함" },
   ];
+  const eventRiskPct = (RARE_EVENTS.reduce((s, x) => s + x.chance, 0)) * 100;
+  const phaseProbs = regimeProbabilities({
+    phaseName: G.marketPhase?.name || "중립",
+    fedRate,
+    riskOn,
+    btcVol: G.btcVol || 0,
+    eventRiskPct,
+  });
+  const newsBrief = buildNewsBriefing(G, macroRows, phaseProbs);
+  const assetMix = [
+    { k: "현금", v: G.cash, c: "#94a3b8" },
+    { k: "BTC", v: G.btc * G.btcUsd * KRW_RATE, c: "#f59e0b" },
+    { k: "주식", v: stVal, c: "#38bdf8" },
+    { k: "부동산", v: aptVal, c: "#a78bfa" },
+    { k: "원자재", v: cmdVal, c: "#22c55e" },
+  ].sort((a, b) => b.v - a.v);
+  const topAsset = assetMix[0];
+  const topRival = rivalBoard.all.find((x) => x.id !== "me");
+  const tagOwnedCount = (G.ownedTags || []).length;
+  const collOwnedCount = (G.collection || []).length;
+  const codexProgress = ((tagOwnedCount + collOwnedCount) / Math.max(1, TAG_DEFS.length + COLLECTIBLES.length)) * 100;
+  const rivalStyleLabel = {
+    lev: "선물/레버리지",
+    hodl: "비트 존버",
+    apt: "부동산 집중",
+    quant: "퀀트 분산",
+    div: "배당 중시",
+    tech: "기술주 추종",
+    yolo: "하이리스크",
+    safe: "안전자산",
+  };
 
   return (
     <div style={S.bg}>
-      {toast && <div style={S.toast}>{toast}</div>}
+      {toast?.msg && (
+        <div
+          style={{
+            ...S.toast,
+            borderColor: toast.level === "bad" ? "#ef444499" : toast.level === "warn" ? "#f59e0b88" : toast.level === "good" ? "#22c55e88" : "#38bdf888",
+            color: toast.level === "bad" ? "#fecaca" : toast.level === "warn" ? "#fbbf24" : toast.level === "good" ? "#86efac" : "#7dd3fc",
+          }}
+        >
+          {toast.msg}
+        </div>
+      )}
       {dateFx && <div style={{ ...S.dateFx, color: dateFx.color }}>{dateFx.txt}</div>}
+      {unlockFx && (
+        <div
+          style={{
+            position: "fixed",
+            top: 90,
+            left: "50%",
+            transform: "translateX(-50%)",
+            zIndex: 31,
+            background: unlockFx.tier === "legendary" ? "#2a1540f0" : unlockFx.tier === "epic" ? "#1f1b45f0" : "#10223bf0",
+            border: `1px solid ${unlockFx.color || "#60a5fa"}`,
+            boxShadow: `0 0 24px ${unlockFx.color || "#60a5fa"}66`,
+            borderRadius: 14,
+            padding: "10px 14px",
+            fontWeight: 800,
+            color: unlockFx.color || "#e2e8f0",
+          }}
+        >
+          {unlockFx.msg}
+        </div>
+      )}
       {eventModal && (
         <div style={S.overlay}>
           <div style={{ ...S.card, width: 440, maxWidth: "100%", borderColor: "#f59e0b" }}>
@@ -1998,14 +2491,13 @@ export default function App() {
       )}
       {rankModal && (
         <div style={S.overlay}>
-          <div style={{ ...S.card, width: 420, maxWidth: "100%", maxHeight: "74vh", borderColor: "#f59e0b", boxShadow: "0 0 30px #f59e0b66", paddingBottom: 8 }}>
-            <div style={{ fontSize: 28, textAlign: "center", textShadow: "0 0 14px #f59e0b99" }}>🏆✨🎉</div>
+          <div style={{ ...S.card, width: 390, maxWidth: "100%", maxHeight: "68vh", borderColor: "#f59e0b", boxShadow: "0 0 24px #f59e0b55", paddingBottom: 8 }}>
             <h3 style={{ margin: 0, color: "#f59e0b", textAlign: "center" }}>분기 중간정산</h3>
             <div style={S.item}>
               <span>{rankModal.y}.{String(rankModal.m).padStart(2, "0")} 분기 랭킹</span>
               <strong>{rankModal.rank}위 / {rankModal.total}명</strong>
             </div>
-            <div style={{ overflowY: "auto", maxHeight: "42vh", display: "flex", flexDirection: "column", gap: 6, paddingRight: 2 }}>
+            <div style={{ overflowY: "auto", maxHeight: "36vh", display: "flex", flexDirection: "column", gap: 6, paddingRight: 2 }}>
               {rankModal.rows.map((r, i) => (
                 <div
                   key={r.id}
@@ -2070,9 +2562,12 @@ export default function App() {
             </div>
           )}
           <div style={S.row}>
-            <span style={S.memeChip}>🚀 TO THE MOON</span>
-            <span style={S.memeChip}>💎 HODL</span>
-            <span style={S.memeChip}>🟠 SATS</span>
+            <span style={S.memeChip}>
+              {G.marketPhase?.name ? `📌 레짐: ${G.marketPhase.name}` : "📌 레짐: 중립"}
+            </span>
+            <span style={S.memeChip}>
+              {newsBrief.headlines[0] ? `📰 ${newsBrief.headlines[0]}` : "📰 뉴스 대기 중"}
+            </span>
           </div>
         </div>
         <div style={{ textAlign: "right" }}>
@@ -2089,6 +2584,26 @@ export default function App() {
         <div style={S.cardMini}><div style={S.muted}>BTC</div><div style={S.big}>{G.btc.toFixed(4)}</div></div>
         <div style={S.cardMini}><div style={S.muted}>원자재</div><div style={S.big}>{fw(cmdVal)}</div></div>
         <div style={S.cardMini}><div style={S.muted}>ROI</div><div style={{ ...S.big, color: roi >= 0 ? "#22c55e" : "#ef4444" }}>{fp(roi)}</div></div>
+      </section>
+      <section style={{ ...S.card, marginBottom: 10, background: "linear-gradient(135deg,#111827,#0b1220)", borderColor: "#334155" }}>
+        <div style={{ ...S.row, justifyContent: "space-between", alignItems: "center" }}>
+          <strong style={{ color: "#f8fafc" }}>오늘의 하이라이트</strong>
+          <span style={S.muted}>{newsBrief.summary}</span>
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(180px,1fr))", gap: 8 }}>
+          <div style={{ ...S.item, borderColor: "#334155" }}>
+            <span>우세 레짐</span>
+            <strong style={{ color: "#f59e0b" }}>{G.marketPhase?.name || "중립"} · {phaseProbs.chop.toFixed(0)}% 횡보</strong>
+          </div>
+          <div style={{ ...S.item, borderColor: "#334155" }}>
+            <span>핵심 자산</span>
+            <strong style={{ color: topAsset?.c || "#e5e7eb" }}>{topAsset?.k || "-"} {topAsset ? fw(topAsset.v) : ""}</strong>
+          </div>
+          <div style={{ ...S.item, borderColor: "#334155" }}>
+            <span>현재 1위 라이벌</span>
+            <strong style={{ color: "#22c55e" }}>{topRival ? `${topRival.icon} ${topRival.name}` : "-"}</strong>
+          </div>
+        </div>
       </section>
 
       <div style={S.tabs}>
@@ -2121,9 +2636,44 @@ export default function App() {
                   </button>
                 ))}
               </div>
-              <span style={S.muted}>X축 날짜 표시</span>
+              <div style={S.row}>
+                {Object.entries(CHART_SKINS).map(([k, v]) => (
+                  <button key={k} style={{ ...S.speed, ...(chartSkin === k ? S.speedOn : null) }} onClick={() => setChartSkin(k)}>
+                    {v.name}
+                  </button>
+                ))}
+              </div>
             </div>
-            <BinanceCandleChart candles={btcHist} tf={chartTf} h={280} />
+            <BinanceCandleChart candles={btcHist} tf={chartTf} h={280} skin={chartSkin} />
+            <div style={{ ...S.card, background: "#0b1220", borderColor: "#334155", gap: 6 }}>
+              <div style={S.muted}>전략 프리셋</div>
+              <div style={S.row}>
+                <button
+                  style={S.chipBtn}
+                  onClick={() => setSpotForm((f) => ({ ...f, side: "buy", type: "market", inputMode: "total", totalKrw: comma(Math.floor(G.cash * 0.1)) }))}
+                >
+                  분할매수 10%
+                </button>
+                <button
+                  style={S.chipBtn}
+                  onClick={() => setSpotForm((f) => ({ ...f, side: "buy", type: "limit", priceKrw: comma(Math.round((btcKrw * 0.995) / 10000) * 10000), inputMode: "total", totalKrw: comma(Math.floor(G.cash * 0.15)) }))}
+                >
+                  눌림목 매수
+                </button>
+                <button
+                  style={S.chipBtn}
+                  onClick={() => setSpotForm((f) => ({ ...f, side: "sell", type: "market", inputMode: "qty", qtyBtc: (G.btc * 0.3).toFixed(6) }))}
+                >
+                  익절 30%
+                </button>
+                <button
+                  style={S.chipBtn}
+                  onClick={() => setFutForm((f) => ({ ...f, side: "short", type: "market", marginKrw: comma(Math.floor(G.cash * 0.12)), lev: "4", stopLoss: "4.5", takeProfit: "7.5" }))}
+                >
+                  헤지 숏 세팅
+                </button>
+              </div>
+            </div>
             <div style={{ ...S.card, background: "#0b1220", borderColor: "#334155" }}>
               <div style={S.row}>
                 {["buy", "sell"].map((side) => (
@@ -2271,7 +2821,7 @@ export default function App() {
               <strong style={{ color: futPnl >= 0 ? "#22c55e" : "#ef4444" }}>{fw(futPnl)}</strong>
             </div>
             <div style={{ ...S.row, justifyContent: "space-between", alignItems: "center" }}>
-              <span style={S.muted}>선물 차트</span>
+              <span style={S.muted}>선물 차트 ({CHART_SKINS[chartSkin]?.name || "바이낸스"})</span>
               <div style={S.row}>
                 {["1D", "1W", "1M"].map((tf) => (
                   <button key={`f_${tf}`} style={{ ...S.speed, ...(chartTf === tf ? S.speedOn : null) }} onClick={() => setChartTf(tf)}>
@@ -2280,7 +2830,7 @@ export default function App() {
                 ))}
               </div>
             </div>
-            <BinanceCandleChart candles={btcHist} tf={chartTf} h={190} />
+            <BinanceCandleChart candles={btcHist} tf={chartTf} h={190} skin={chartSkin} />
             <div style={{ ...S.card, background: "#0b1220", borderColor: "#334155", gap: 10 }}>
               <div style={S.row}>
                 {["long", "short"].map((side) => (
@@ -2764,6 +3314,22 @@ export default function App() {
             <div style={S.item}><span>닉네임</span><strong>{G.myNick}</strong></div>
             <div style={S.item}><span>장착 태그</span><strong>{G.equippedTagId ? `${TAG_DEFS.find((t) => t.id === G.equippedTagId)?.icon || ""} ${TAG_DEFS.find((t) => t.id === G.equippedTagId)?.name || ""}` : "없음"}</strong></div>
             <div style={{ ...S.card, background: "#0b1220", borderColor: "#334155" }}>
+              <div style={{ ...S.row, justifyContent: "space-between", alignItems: "center" }}>
+                <strong style={{ color: "#f8fafc" }}>프로필 쇼케이스</strong>
+                <span style={{ color: codexProgress >= 90 ? "#c084fc" : "#93c5fd", fontWeight: 800 }}>도감 {codexProgress.toFixed(1)}%</span>
+              </div>
+              <div style={S.item}><span>총자산</span><strong>{fw(G.total)}</strong></div>
+              <div style={S.item}><span>태그 해금</span><strong>{tagOwnedCount} / {TAG_DEFS.length}</strong></div>
+              <div style={S.item}><span>수집품 해금</span><strong>{collOwnedCount} / {COLLECTIBLES.length}</strong></div>
+              <div style={S.item}><span>대표 성향</span><strong style={{ color: topAsset?.c || "#e5e7eb" }}>{topAsset?.k || "현금"} 중심</strong></div>
+              {codexProgress >= 100 && (
+                <div style={{ ...S.item, borderColor: "#c084fc", boxShadow: "0 0 14px #c084fc66" }}>
+                  <span>도감 완성 보상</span>
+                  <strong style={{ color: "#c084fc" }}>🏆 오버클록 수집가</strong>
+                </div>
+              )}
+            </div>
+            <div style={{ ...S.card, background: "#0b1220", borderColor: "#334155" }}>
               <div style={{ ...S.muted, marginBottom: 6 }}>획득한 태그에서 선택</div>
               {(G.ownedTags || []).length === 0 && <div style={S.muted}>아직 획득한 태그가 없습니다.</div>}
               {(G.ownedTags || []).map((tid) => {
@@ -2793,6 +3359,18 @@ export default function App() {
 
         {tab === "codex" && (
           <div style={S.card}>
+            <div style={S.item}>
+              <span>도감 진행률</span>
+              <strong style={{ color: codexProgress >= 90 ? "#c084fc" : "#93c5fd" }}>
+                {codexProgress.toFixed(1)}%
+              </strong>
+            </div>
+            {G.codexCrown && (
+              <div style={{ ...S.item, borderColor: "#c084fc", boxShadow: "0 0 14px #c084fc66" }}>
+                <span>완성 보상</span>
+                <strong style={{ color: "#c084fc" }}>🏆 오버클록 수집가</strong>
+              </div>
+            )}
             <div style={S.item}>
               <span>태그 도감</span>
               <strong>{(G.ownedTags || []).length} / {TAG_DEFS.length}</strong>
@@ -2920,15 +3498,19 @@ export default function App() {
               const weak = [...segs].sort((a, b) => a.v - b.v)[0];
               return (
                 <div style={{ ...S.card, background: "#111827", borderColor: "#f59e0b", position: "sticky", top: 6, zIndex: 5 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                    <strong style={{ color: "#f59e0b" }}>{rival.icon} {rival.name}</strong>
-                    <button style={S.chipBtn} onClick={() => setInspectRivalId(null)}>닫기</button>
-                  </div>
-                  <div style={S.row}>
-                    {p.tags.map((t) => (
-                      <span key={t} style={{ ...S.tagChip, background: `${pickTagColor(t)}1f`, borderColor: `${pickTagColor(t)}99`, color: pickTagColor(t) }}>#{t}</span>
-                    ))}
-                  </div>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <strong style={{ color: "#f59e0b" }}>{rival.icon} {rival.name}</strong>
+                  <button style={S.chipBtn} onClick={() => setInspectRivalId(null)}>닫기</button>
+                </div>
+                <div style={S.item}>
+                  <span>전략 타입</span>
+                  <strong style={{ color: "#93c5fd" }}>{rivalStyleLabel[row.style] || "혼합형"}</strong>
+                </div>
+                <div style={S.row}>
+                  {p.tags.map((t) => (
+                    <span key={t} style={{ ...S.tagChip, background: `${pickTagColor(t)}1f`, borderColor: `${pickTagColor(t)}99`, color: pickTagColor(t) }}>#{t}</span>
+                  ))}
+                </div>
                   <div style={{ color: "#fef3c7", fontWeight: 700 }}>\"{p.quote}\"</div>
                   <div style={{ color: "#fcd34d", fontSize: 13 }}>🎯 {p.quirk}</div>
                   <div style={{ ...S.item, background: "#0b1220", borderColor: "#374151" }}>
@@ -2984,6 +3566,9 @@ export default function App() {
                 <span>
                   {idx + 1}. {r.icon} {r.name}
                   {r.id !== "me" && (
+                    <span style={{ ...S.muted, marginLeft: 8, color: "#93c5fd" }}>{rivalStyleLabel[r.style] || "혼합형"}</span>
+                  )}
+                  {r.id !== "me" && (
                     <span style={{ marginLeft: 8 }}>
                       {(RIVAL_PROFILES[r.id]?.tags || []).slice(0, 2).map((t) => (
                         <span key={t} style={{ ...S.tagChip, marginLeft: 4, fontSize: 10, padding: "1px 6px", background: `${pickTagColor(t)}1f`, borderColor: `${pickTagColor(t)}99`, color: pickTagColor(t) }}>#{t}</span>
@@ -3020,13 +3605,32 @@ export default function App() {
 
         {tab === "news" && (
           <div style={S.card}>
+            <div style={{ ...S.card, background: "#0b1220", borderColor: "#334155" }}>
+              <div style={{ ...S.row, justifyContent: "space-between", alignItems: "center" }}>
+                <strong style={{ color: "#f8fafc" }}>{newsBrief.title}</strong>
+                <span style={{ ...S.muted, color: "#fbbf24" }}>{newsBrief.summary}</span>
+              </div>
+              <div style={{ ...S.muted, color: "#cbd5e1" }}>핵심 헤드라인</div>
+              {newsBrief.headlines.length === 0 && <div style={S.muted}>아직 핵심 뉴스가 없습니다.</div>}
+              {newsBrief.headlines.map((h, i) => (
+                <div key={`brief_h_${i}`} style={S.item}>
+                  <span>{i + 1}. {h}</span>
+                </div>
+              ))}
+              <div style={{ ...S.muted, color: "#93c5fd" }}>거시 요약</div>
+              {newsBrief.macros.map((m, i) => (
+                <div key={`brief_m_${i}`} style={S.item}>
+                  <span>{m}</span>
+                </div>
+              ))}
+            </div>
             {pastEvents.length === 0 && <div style={S.muted}>아직 발생한 뉴스가 없습니다.</div>}
             {pastEvents.map((e, i) => (
               <div key={i} style={S.item}>
                 <span>
                   {e.y}.{String(e.m).padStart(2, "0")}.{String(e.d).padStart(2, "0")}
                 </span>
-                <span style={{ color: e.et === "rare" ? "#c084fc" : "#e5e7eb" }}>{e.title || e.e}</span>
+                <span style={{ color: e.et === "rare" ? "#c084fc" : e.et === "meme" ? "#f59e0b" : "#e5e7eb" }}>{e.title || e.e}</span>
               </div>
             ))}
           </div>
@@ -3046,6 +3650,26 @@ export default function App() {
                 </span>
               </div>
             ))}
+            <div style={{ ...S.card, background: "#0b1220", borderColor: "#334155" }}>
+              <div style={{ ...S.muted, color: "#f8fafc" }}>다음 레짐 확률 (추정)</div>
+              {[
+                { k: "상승장", v: phaseProbs.bull, c: "#22c55e" },
+                { k: "횡보장", v: phaseProbs.chop, c: "#94a3b8" },
+                { k: "약세장", v: phaseProbs.bear, c: "#ef4444" },
+                { k: "대폭락장", v: phaseProbs.deepBear, c: "#f97316" },
+                { k: "쇼트스퀴즈", v: phaseProbs.squeeze, c: "#06b6d4" },
+              ].map((r) => (
+                <div key={r.k} style={{ marginBottom: 6 }}>
+                  <div style={{ ...S.row, justifyContent: "space-between" }}>
+                    <span style={S.muted}>{r.k}</span>
+                    <strong style={{ color: r.c }}>{r.v.toFixed(1)}%</strong>
+                  </div>
+                  <div style={{ height: 6, borderRadius: 999, background: "#1f2937", overflow: "hidden" }}>
+                    <div style={{ width: `${r.v}%`, height: "100%", background: r.c }} />
+                  </div>
+                </div>
+              ))}
+            </div>
             <div style={S.muted}>그래프 없이 월별 변화만 빠르게 확인하도록 구성했습니다.</div>
           </div>
         )}
@@ -3094,6 +3718,20 @@ export default function App() {
             {s}x
           </button>
         ))}
+        <button
+          style={S.speed}
+          onClick={() => {
+            try {
+              localStorage.setItem("btc_tycoon_save_v1", JSON.stringify({ ...G, multi, players }));
+              setSavedGame({ ...G, multi, players });
+              toastPush("게임 저장 완료");
+            } catch (_e) {
+              toastPush("저장 실패", "bad", 2);
+            }
+          }}
+        >
+          저장하기
+        </button>
         <button
           style={S.speed}
           onClick={() => {
@@ -3172,5 +3810,7 @@ const S = {
   buyOn: { borderColor: "#22c55e", color: "#22c55e", background: "#14532d44" },
   sellOn: { borderColor: "#ef4444", color: "#ef4444", background: "#7f1d1d44" },
 };
+
+
 
 
