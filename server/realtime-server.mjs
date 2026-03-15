@@ -16,6 +16,7 @@ function getRoom(code) {
       pauseLimit: 3,
       endYear: 2041,
       startCash: 100000000,
+      speed: 1,
     });
   }
   return rooms.get(code);
@@ -37,6 +38,7 @@ function roomView(room) {
     pauseLimit: room.pauseLimit,
     endYear: room.endYear,
     startCash: room.startCash,
+    speed: room.speed || 1,
     players: room.players.map((p) => ({
       id: p.id,
       nickname: p.nickname,
@@ -98,6 +100,38 @@ wss.on("connection", (ws) => {
       room.started = true;
       room.pausedBy = null;
       broadcast(room, { type: "start_game", room: roomView(room) });
+      return;
+    }
+
+    if (data.type === "update_settings") {
+      if (joined.id !== room.hostId) return;
+      if (typeof data.endYear === "number") room.endYear = Math.max(2028, Math.min(2060, Math.floor(data.endYear)));
+      if (typeof data.pauseLimit === "number") {
+        room.pauseLimit = Math.max(1, Math.min(10, Math.floor(data.pauseLimit)));
+        room.players.forEach((p) => {
+          p.pauseLeft = Math.max(0, Math.min(p.pauseLeft, room.pauseLimit));
+        });
+      }
+      if (typeof data.speed === "number") {
+        const ok = [1, 2, 4, 10, 20].includes(data.speed) ? data.speed : 1;
+        room.speed = ok;
+      }
+      broadcast(room, { type: "room_state", room: roomView(room) });
+      return;
+    }
+
+    if (data.type === "kick") {
+      if (joined.id !== room.hostId) return;
+      const targetId = String(data.targetId || "");
+      if (!targetId || targetId === room.hostId) return;
+      const target = room.players.find((p) => p.id === targetId);
+      if (!target) return;
+      try {
+        if (target.ws.readyState === 1) target.ws.send(JSON.stringify({ type: "kicked", by: room.hostId }));
+        target.ws.close();
+      } catch (_e) {}
+      room.players = room.players.filter((p) => p.id !== targetId);
+      broadcast(room, { type: "room_state", room: roomView(room) });
       return;
     }
 

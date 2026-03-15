@@ -2,6 +2,10 @@
 
 const KRW_RATE = 1473;
 const MONTHLY_SALARY = 3_000_000;
+const DEFAULT_WS_URL =
+  typeof window !== "undefined" && (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1")
+    ? "ws://127.0.0.1:8787"
+    : "wss://bitcoin-tycoon-rt.onrender.com";
 const MO = ["1월", "2월", "3월", "4월", "5월", "6월", "7월", "8월", "9월", "10월", "11월", "12월"];
 const DIM = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 
@@ -507,6 +511,11 @@ function normalizeGame(raw) {
     btc: raw.btc ?? 0,
     btcUsd: raw.btcUsd ?? getBtcUsd(2026, 3, 11),
     btcPrev: raw.btcPrev ?? raw.btcUsd ?? getBtcUsd(2026, 3, 11),
+    btcPrevRet: raw.btcPrevRet ?? 0,
+    btcVol: raw.btcVol ?? 0.028,
+    btcEps: raw.btcEps ?? 0,
+    btcRegime: raw.btcRegime ?? "chop",
+    btcRegimeLeft: raw.btcRegimeLeft ?? 0,
     endYear: raw.endYear ?? 2041,
     myNick: raw.myNick ?? "플레이어",
     pauseLimit: raw.pauseLimit ?? 3,
@@ -514,6 +523,7 @@ function normalizeGame(raw) {
     scenario: raw.scenario ?? makeScenario(raw.gameSeed ?? 1),
     equippedTagId: raw.equippedTagId ?? null,
     activeMacro: raw.activeMacro ?? null,
+    marketPhase: raw.marketPhase ?? null,
     newsLog: Array.isArray(raw.newsLog) ? raw.newsLog : [],
     apts: Array.isArray(raw.apts) ? raw.apts : [],
     stocks: Array.isArray(raw.stocks) ? raw.stocks : [],
@@ -635,7 +645,9 @@ const EVENTS = [
   { y: 2026, m: 9, d: 22, e: "글로벌 경기침체 우려", et: "crash", shock: -0.2 },
   { y: 2027, m: 5, d: 8, e: "AI 기업들 BTC 보유 선언", et: "positive", shock: 0.18 },
   { y: 2028, m: 4, d: 1, e: "다섯 번째 반감기", et: "halving", shock: 0.12 },
+  { y: 2028, m: 5, d: 20, e: "반감기 이후 과열 청산: 급락장", et: "crash", shock: -0.6 },
   { y: 2029, m: 7, d: 18, e: "대형 기관 패닉셀", et: "crash", shock: -0.25 },
+  { y: 2032, m: 5, d: 17, e: "반감기 후 디레버리징", et: "crash", shock: -0.45 },
 ];
 const RARE_EVENTS = [
   { id: "depression", name: "세계 경제 대공황", chance: 0.0022, btc: -0.35, eq: -0.42, re: -0.18, months: 10, et: "rare" },
@@ -775,7 +787,6 @@ function Setup({ onStart, onContinue, canContinue }) {
   const [fillBots, setFillBots] = useState(true);
   const [customMode, setCustomMode] = useState(false);
   const [roomCode, setRoomCode] = useState("ROOM1");
-  const [serverUrl, setServerUrl] = useState("ws://127.0.0.1:8787");
   const units = { 만원: 1e4, 천만원: 1e7, 억원: 1e8, 십억원: 1e9 };
   const startCash = clamp((parseFloat(cash || "0") || 1) * units[unit], 1e6, 1e13);
   const approxDays = Math.max(30, (endYear - 2026) * 365 + 295);
@@ -826,13 +837,12 @@ function Setup({ onStart, onContinue, canContinue }) {
             {customMode && (
               <>
                 <input value={roomCode} onChange={(e) => setRoomCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 12))} placeholder="방 코드" style={S.input} />
-                <input value={serverUrl} onChange={(e) => setServerUrl(e.target.value)} placeholder="ws://127.0.0.1:8787" style={S.input} />
-                <div style={{ ...S.muted, color: "#f59e0b" }}>서버 시작 후 같은 roomCode로 친구 접속</div>
+                <div style={{ ...S.muted, color: "#f59e0b" }}>서버 주소는 자동 적용됩니다. 같은 roomCode로 친구 접속</div>
               </>
             )}
           </div>
         )}
-        <button style={S.btnPri} onClick={() => onStart({ startCash, mode, nickname: nickname || "플레이어", endYear, pauseLimit, fillBots, customMode, roomCode, serverUrl })}>
+        <button style={S.btnPri} onClick={() => onStart({ startCash, mode, nickname: nickname || "플레이어", endYear, pauseLimit, fillBots, customMode, roomCode })}>
           게임 시작
         </button>
         <div style={S.muted}>종료연도/일시정지/멀티옵션은 게임 시작 시 반영됩니다.</div>
@@ -846,9 +856,18 @@ function Setup({ onStart, onContinue, canContinue }) {
   );
 }
 
-function Lobby({ players, onReady, onStart, onBack }) {
+function Lobby({ players, roomState, onReady, onStart, onBack, onApplySettings, onKick }) {
   const me = players.find((p) => !p.isBot && p.icon === "🎮") || players.find((p) => !p.isBot);
   const allReady = players.every((p) => p.ready);
+  const isHost = !!me?.isHost;
+  const [localEndYear, setLocalEndYear] = useState(roomState?.endYear || 2041);
+  const [localPause, setLocalPause] = useState(roomState?.pauseLimit || 3);
+  const [localSpeed, setLocalSpeed] = useState(roomState?.speed || 1);
+  useEffect(() => {
+    setLocalEndYear(roomState?.endYear || 2041);
+    setLocalPause(roomState?.pauseLimit || 3);
+    setLocalSpeed(roomState?.speed || 1);
+  }, [roomState?.endYear, roomState?.pauseLimit, roomState?.speed]);
   return (
     <div style={S.bgCenter}>
       <div style={{ ...S.card, width: 560, maxWidth: "100%" }}>
@@ -858,14 +877,39 @@ function Lobby({ players, onReady, onStart, onBack }) {
           {players.map((p) => (
             <div key={p.id} style={S.item}>
               <span>{p.icon || "🎮"} {p.nickname} {p.isBot ? "(BOT)" : ""} {!p.isBot ? `· 정지 ${p.pauseLeft ?? 0}회` : ""}</span>
-              <strong style={{ color: p.ready ? "#22c55e" : "#f59e0b" }}>{p.ready ? "준비" : "대기"}</strong>
+              <span style={S.row}>
+                <strong style={{ color: p.ready ? "#22c55e" : "#f59e0b" }}>{p.ready ? "준비" : "대기"}</strong>
+                {isHost && !p.isHost && (
+                  <button style={S.btnDanger} onClick={() => onKick?.(p.id)}>강퇴</button>
+                )}
+              </span>
             </div>
           ))}
         </div>
+        {isHost && (
+          <div style={{ ...S.card, background: "#0b1220", borderColor: "#334155" }}>
+            <div style={{ ...S.muted, marginBottom: 6 }}>방장 설정</div>
+            <div style={S.row}>
+              <span style={S.muted}>종료연도</span>
+              <select value={localEndYear} onChange={(e) => setLocalEndYear(parseInt(e.target.value, 10))} style={S.select}>
+                {Array.from({ length: 20 }, (_, i) => 2028 + i).map((y) => <option key={y} value={y}>{y}</option>)}
+              </select>
+              <span style={S.muted}>일시정지</span>
+              <select value={localPause} onChange={(e) => setLocalPause(parseInt(e.target.value, 10))} style={S.select}>
+                {[1, 2, 3, 4, 5, 6, 7, 8].map((n) => <option key={n} value={n}>{n}회</option>)}
+              </select>
+              <span style={S.muted}>기본 배속</span>
+              <select value={localSpeed} onChange={(e) => setLocalSpeed(parseInt(e.target.value, 10))} style={S.select}>
+                {[1, 2, 4, 10, 20].map((n) => <option key={n} value={n}>{n}x</option>)}
+              </select>
+              <button style={S.btnPri} onClick={() => onApplySettings?.({ endYear: localEndYear, pauseLimit: localPause, speed: localSpeed })}>설정 적용</button>
+            </div>
+          </div>
+        )}
         <div style={S.row}>
           <button style={S.speed} onClick={onBack}>뒤로</button>
           <button style={me?.ready ? S.btnDanger : S.btnPri} onClick={onReady}>{me?.ready ? "준비취소" : "준비"}</button>
-          <button style={allReady ? S.btnPri : S.speed} onClick={onStart} disabled={!allReady}>시작</button>
+          <button style={allReady && isHost ? S.btnPri : S.speed} onClick={onStart} disabled={!allReady || !isHost}>시작</button>
         </div>
       </div>
     </div>
@@ -1058,6 +1102,7 @@ export default function App() {
   const [depWdPct, setDepWdPct] = useState(25);
   const [selectedTagId, setSelectedTagId] = useState(null);
   const [selectedCollectibleId, setSelectedCollectibleId] = useState(null);
+  const [roomState, setRoomState] = useState(null);
 
   const btcKrw = useMemo(() => (G ? G.btcUsd * KRW_RATE : 0), [G]);
   const rivalBoard = useMemo(() => {
@@ -1110,6 +1155,7 @@ export default function App() {
       }
       if (!m) return;
       if (m.type === "room_state" && m.room) {
+        setRoomState(m.room);
         setPlayers(
           (m.room.players || []).map((p) => ({
             id: p.id,
@@ -1125,8 +1171,17 @@ export default function App() {
             roi: 0,
           })),
         );
+        if (multi?.customMode) {
+          if (typeof m.room.speed === "number") setSpd(m.room.speed);
+          setG((prev) => (prev ? { ...prev, endYear: m.room.endYear || prev.endYear, pauseLimit: m.room.pauseLimit || prev.pauseLimit } : prev));
+        }
       }
       if (m.type === "start_game") {
+        if (m.room) {
+          setRoomState(m.room);
+          if (typeof m.room.speed === "number") setSpd(m.room.speed);
+          setG((prev) => (prev ? { ...prev, endYear: m.room.endYear || prev.endYear, pauseLimit: m.room.pauseLimit || prev.pauseLimit } : prev));
+        }
         setScreen("game");
         setPausedBy(null);
         setRun(true);
@@ -1138,6 +1193,14 @@ export default function App() {
       if (m.type === "resume_game") {
         setPausedBy(null);
         setRun(true);
+      }
+      if (m.type === "kicked") {
+        setToast("방장에서 강퇴되었습니다");
+        setRun(false);
+        setScreen("setup");
+        setMulti(null);
+        setPlayers([]);
+        setRoomState(null);
       }
     };
     ws.onclose = () => {
@@ -1162,11 +1225,34 @@ export default function App() {
     setBtcHist((prev) => {
       const last = prev[prev.length - 1];
       if (last && last.k === key && last.c === G.btcUsd) return prev;
-      const o = last ? last.c : G.btcPrev || G.btcUsd;
+      const prevClose = last ? last.c : G.btcPrev || G.btcUsd;
+      const gSeed = G.gameSeed || 1;
+      const gapSeed = randSigned(gSeed, "gap", G.year, G.month, G.day);
+      const gap = (G.btcVol || 0.02) * (0.08 + Math.abs(randSigned(gSeed, "gap2", G.year, G.month, G.day)) * 0.42) * gapSeed;
+      const o = prevClose * (1 + gap);
       const c = G.btcUsd;
-      const wave = 0.003 + Math.abs(Math.sin((G.year * 1000 + G.month * 40 + G.day) * 0.17)) * 0.01;
-      const h = Math.max(o, c) * (1 + wave);
-      const l = Math.min(o, c) * (1 - wave);
+      const absRet = Math.abs(c / (o || 1) - 1);
+      const baseVol = clamp((G.btcVol || 0.02) * (0.45 + Math.abs(randSigned(gSeed, "v1", G.year, G.month, G.day)) * 1.6) + absRet * 0.55, 0.0025, 0.2);
+      const shapeRoll = h32(gSeed, "shape", G.year, G.month, G.day) / 0xffffffff;
+      let upperMul = 1.0;
+      let lowerMul = 1.0;
+      if (shapeRoll < 0.12) {
+        upperMul = 0.18; lowerMul = 0.18; // marubozu 유사
+      } else if (shapeRoll < 0.24) {
+        upperMul = 0.22; lowerMul = 2.4; // hammer
+      } else if (shapeRoll < 0.36) {
+        upperMul = 2.4; lowerMul = 0.22; // inverted hammer / shooting
+      } else if (shapeRoll < 0.50) {
+        upperMul = 1.8; lowerMul = 1.8; // long-legged doji 영역
+      } else if (shapeRoll < 0.66) {
+        upperMul = 0.45; lowerMul = 1.35;
+      } else if (shapeRoll < 0.82) {
+        upperMul = 1.35; lowerMul = 0.45;
+      }
+      const wickUpSeed = 0.55 + Math.abs(randSigned(gSeed, "wickUp", G.year, G.month, G.day)) * 1.1;
+      const wickDnSeed = 0.55 + Math.abs(randSigned(gSeed, "wickDn", G.year, G.month, G.day)) * 1.1;
+      const h = Math.max(o, c) * (1 + baseVol * upperMul * wickUpSeed);
+      const l = Math.max(1000, Math.min(o, c) * (1 - baseVol * lowerMul * wickDnSeed));
       return [...prev.slice(-239), { k: key, o, h, l, c }];
     });
     setWealthHist((prev) => {
@@ -1218,14 +1304,95 @@ export default function App() {
           setTimeout(() => setDateFx(null), 1200);
         }
 
-        let btcUsd = getBtcUsd(y, m, d);
         const sig = marketSignal(p.gameSeed || 1, y, m, d, p.scenario || makeScenario(p.gameSeed || 1));
         const macro = p.activeMacro;
         const macroMul = macro ? { btc: macro.btc || 0, eq: macro.eq || 0, re: macro.re || 0 } : { btc: 0, eq: 0, re: 0 };
-        btcUsd *= 1 + sig.btc + macroMul.btc;
+        let marketPhase = p.marketPhase || null;
+        if (d === 1) {
+          if (marketPhase?.leftMonths > 0) {
+            marketPhase = { ...marketPhase, leftMonths: marketPhase.leftMonths - 1 };
+          } else {
+            marketPhase = null;
+          }
+          if (!marketPhase) {
+            const roll = h32(p.gameSeed || 1, y, m, "phase") / 0xffffffff;
+            if (roll < 0.11) {
+              marketPhase = { id: "sideways", name: "횡보장", btc: -0.002, eq: -0.001, re: -0.0006, leftMonths: 6 + Math.floor((roll * 100) % 4) };
+            } else if (roll < 0.2) {
+              marketPhase = { id: "bear", name: "약세장", btc: -0.012, eq: -0.007, re: -0.003, leftMonths: 8 + Math.floor((roll * 100) % 6) };
+            } else if (roll < 0.24) {
+              marketPhase = { id: "deep_bear", name: "대폭락장", btc: -0.022, eq: -0.012, re: -0.006, leftMonths: 5 + Math.floor((roll * 100) % 5) };
+            }
+            if (marketPhase) setToast(`시장 레짐 전환: ${marketPhase.name}`);
+          }
+        }
+        const hawkish = Math.max(0, getFedRate(y, m) - 4.25);
+        const ratePenalty = {
+          btc: -0.0025 * hawkish,
+          eq: -0.0018 * hawkish,
+          re: -0.0012 * hawkish,
+        };
+        const phasePenalty = marketPhase ? { btc: marketPhase.btc, eq: marketPhase.eq, re: marketPhase.re } : { btc: 0, eq: 0, re: 0 };
+        const prevRet = p.btcPrevRet || 0;
+        const prevVol = p.btcVol || 0.028;
+        const prevEps = p.btcEps || 0;
+        let btcRegime = p.btcRegime || "chop";
+        let btcRegimeLeft = p.btcRegimeLeft || 0;
+        if (btcRegimeLeft <= 0) {
+          const r = h32(p.gameSeed || 1, "btc_regime", y, m, d) / 0xffffffff;
+          if (r < 0.16) btcRegime = "bear";
+          else if (r < 0.29) btcRegime = "bull";
+          else if (r < 0.37) btcRegime = "panic";
+          else if (r < 0.45) btcRegime = "squeeze";
+          else btcRegime = "chop";
+          const durMap = {
+            chop: [2, 18],
+            bear: [4, 26],
+            bull: [4, 22],
+            panic: [1, 7],
+            squeeze: [1, 6],
+          };
+          const [lo, hi] = durMap[btcRegime] || [3, 12];
+          const rDur = h32(p.gameSeed || 1, "btc_regime_dur", y, m, d) / 0xffffffff;
+          btcRegimeLeft = lo + Math.floor(rDur * (hi - lo + 1));
+        } else {
+          btcRegimeLeft -= 1;
+        }
+        const reg = {
+          chop: { drift: 0.00002, volMul: 0.75, phi: -0.08 },
+          bear: { drift: -0.00155, volMul: 1.35, phi: 0.18 },
+          bull: { drift: 0.00125, volMul: 1.15, phi: 0.16 },
+          panic: { drift: -0.0052, volMul: 2.1, phi: 0.32 },
+          squeeze: { drift: 0.0042, volMul: 1.95, phi: 0.28 },
+        }[btcRegime] || { drift: 0, volMul: 1, phi: 0 };
+        const z1 = randSigned(p.gameSeed || 1, "btc_z1", y, m, d);
+        const z2 = randSigned(p.gameSeed || 1, "btc_z2", y, m, d);
+        const z = (z1 + z2 + randSigned(p.gameSeed || 1, "btc_z3", y, m, d)) / 1.75;
+        const coreTarget = clamp(
+          0.015 +
+            Math.abs(sig.btc) * 0.34 +
+            Math.abs(phasePenalty.btc) * 0.65 +
+            hawkish * 0.001 +
+            ((p.scenario?.vol || 1) - 1) * 0.01,
+          0.010,
+          0.12,
+        );
+        const btcVol = clamp(prevVol * 0.88 + coreTarget * 0.12, 0.009, 0.16);
+        const eps = clamp(prevEps * 0.42 + z * btcVol * reg.volMul, -0.22, 0.22);
+        const drift = 0.00012 + (p.scenario?.btcBias || 0) * 0.22 + macroMul.btc * 0.45 + phasePenalty.btc * 0.45 + ratePenalty.btc * 0.9 + reg.drift;
+        const ar = clamp(prevRet * (0.14 + reg.phi), -0.1, 0.1);
+        const jRoll = h32(p.gameSeed || 1, "btc_jump", y, m, d) / 0xffffffff;
+        const jProb = clamp(0.016 + btcVol * 0.52 + (btcRegime === "panic" || btcRegime === "squeeze" ? 0.02 : 0), 0.012, 0.12);
+        const jMagSeed = h32(p.gameSeed || 1, "btc_jump_mag", y, m, d) / 0xffffffff;
+        const dirSeed = randSigned(p.gameSeed || 1, "btc_jump_dir", y, m, d);
+        const dirBias = (btcRegime === "bear" ? -0.35 : 0) + (btcRegime === "panic" ? -0.55 : 0) + (btcRegime === "bull" ? 0.25 : 0) + (btcRegime === "squeeze" ? 0.5 : 0);
+        const jDir = (dirSeed + dirBias) >= 0 ? 1 : -1;
+        const jump = jRoll < jProb ? jDir * (0.016 + Math.pow(jMagSeed, 0.55) * 0.18) : 0;
+        const dailyRet = clamp(drift + ar + eps + jump, -0.32, 0.32);
+        let btcUsd = Math.max(7000, p.btcUsd * (1 + dailyRet));
         const ev = EVENTS.find((e) => e.y === y && e.m === m && e.d === d);
         if (ev && !p.doneEvents.includes(`${ev.y}-${ev.m}-${ev.d}`)) {
-          btcUsd *= 1 + ev.shock;
+          btcUsd *= Math.max(0.2, 1 + ev.shock);
           setEventModal({ ev });
           setRun(false);
           stats.eventCount += 1;
@@ -1233,11 +1400,11 @@ export default function App() {
         }
         let rareEv = null;
         if (d === 1) {
-          const roll = (h32(p.gameSeed || 1, y, m, "rare") / 0xffffffff);
+          const roll = h32(p.gameSeed || 1, y, m, "rare") / 0xffffffff;
           const candidate = RARE_EVENTS.find((r2) => roll < r2.chance);
           if (candidate && !(p.newsLog || []).some((n) => n.id === candidate.id && n.y === y && n.m === m)) {
             rareEv = candidate;
-            btcUsd *= 1 + candidate.btc;
+            btcUsd *= Math.max(0.15, 1 + candidate.btc);
             setEventModal({ ev: { e: `⚠ 레어 이벤트: ${candidate.name}`, et: "rare" } });
             setRun(false);
             stats.eventCount += 1;
@@ -1270,9 +1437,9 @@ export default function App() {
         const loans = p.loans.map((loan) => ({ ...loan, rate: loanRate }));
         let monthlyLoanInterest = loans.reduce((sum, loan) => sum + monthlyInterest(loan.principal, loanRate), 0);
 
-        const reDrift = projectedDrift("krRe", y, m) + sig.re + macroMul.re;
-        const usEqDrift = projectedDrift("usEq", y, m) + sig.eq + macroMul.eq;
-        const cmdDrift = projectedDrift("usEq", y, m) * 0.6 + sig.eq * 0.7 + macroMul.eq * 0.55;
+        const reDrift = projectedDrift("krRe", y, m) + sig.re + macroMul.re + phasePenalty.re + ratePenalty.re;
+        const usEqDrift = projectedDrift("usEq", y, m) + sig.eq + macroMul.eq + phasePenalty.eq + ratePenalty.eq;
+        const cmdDrift = projectedDrift("usEq", y, m) * 0.6 + sig.eq * 0.7 + macroMul.eq * 0.55 + phasePenalty.eq * 0.8;
         const apts = p.apts.map((a) => {
           const idNoise = Math.sin((y * 29 + m * 7 + d + a.id.charCodeAt(0)) * 0.13) * 0.0025;
           return { ...a, cur: a.cur * (1 + a.g / 24 + reDrift + idNoise) };
@@ -1646,6 +1813,11 @@ export default function App() {
           day: d,
           btcPrev: p.btcUsd,
           btcUsd,
+          btcPrevRet: dailyRet,
+          btcVol,
+          btcEps: eps,
+          btcRegime,
+          btcRegimeLeft,
           cash,
           btc,
           deposits,
@@ -1657,6 +1829,7 @@ export default function App() {
           spotOrders,
           futOrders,
           points: 0,
+          marketPhase,
           stats,
           total,
         };
@@ -1725,7 +1898,7 @@ export default function App() {
           setWealthHist([{ k: `${g2.year}-${g2.month}-${g2.day}`, v: g2.total }]);
           setScreen("game");
         }}
-        onStart={({ startCash, mode, nickname, endYear, pauseLimit, fillBots, customMode, roomCode, serverUrl }) => {
+        onStart={({ startCash, mode, nickname, endYear, pauseLimit, fillBots, customMode, roomCode }) => {
           const gameSeed = (Date.now() ^ Math.floor(Math.random() * 0xffffffff)) >>> 0;
           const bp = getBtcUsd(2026, 3, 11);
           const baseGame = normalizeGame({
@@ -1755,7 +1928,7 @@ export default function App() {
             collection: [],
             doneEvents: [],
             total: startCash,
-            multi: mode === "multi" ? { enabled: true, nickname, fillBots, customMode, roomCode, serverUrl, pauseLimit } : null,
+            multi: mode === "multi" ? { enabled: true, nickname, fillBots, customMode, roomCode, serverUrl: DEFAULT_WS_URL, pauseLimit } : null,
             players: [],
           });
           setG(baseGame);
@@ -1763,11 +1936,13 @@ export default function App() {
             const me = { id: clientIdRef.current, nickname, icon: "🎮", isHost: true, pauseLeft: pauseLimit, isBot: false, ready: false, cash: startCash, btc: 0, total: startCash, roi: 0 };
             const bots = fillBots ? makeBots(customMode ? 0 : 5, startCash).map((b) => ({ ...b, pauseLeft: 0 })) : [];
             setPlayers([me, ...bots]);
-            setMulti({ enabled: true, nickname, fillBots, customMode, pauseLimit, roomCode, serverUrl });
+            setMulti({ enabled: true, nickname, fillBots, customMode, pauseLimit, roomCode, serverUrl: DEFAULT_WS_URL });
+            setRoomState({ endYear, pauseLimit, speed: 1, players: [me, ...bots], hostId: me.id });
             setScreen("lobby");
           } else {
             setPlayers([]);
             setMulti(null);
+            setRoomState(null);
             setScreen("game");
           }
           setBtcHist([{ k: "2026-3-11", o: bp, h: bp, l: bp, c: bp }]);
@@ -1781,10 +1956,12 @@ export default function App() {
     return (
       <Lobby
         players={players}
+        roomState={roomState}
         onBack={() => {
           setScreen("setup");
           setMulti(null);
           setPlayers([]);
+          setRoomState(null);
         }}
         onReady={() => {
           if (multi?.customMode) {
@@ -1802,6 +1979,23 @@ export default function App() {
           setPlayers((p) => p.map((x) => (x.id === clientIdRef.current ? { ...x, ready: true } : x)));
           setRun(true);
           setScreen("game");
+        }}
+        onApplySettings={({ endYear, pauseLimit, speed }) => {
+          if (multi?.customMode) {
+            sendWs({ type: "update_settings", endYear, pauseLimit, speed });
+            return;
+          }
+          setPlayers((p) => p.map((x) => ({ ...x, pauseLeft: Math.min(x.pauseLeft ?? pauseLimit, pauseLimit) })));
+          setG((prev) => (prev ? { ...prev, endYear, pauseLimit } : prev));
+          setSpd(speed || 1);
+          setRoomState((rs) => ({ ...(rs || {}), endYear, pauseLimit, speed }));
+        }}
+        onKick={(targetId) => {
+          if (multi?.customMode) {
+            sendWs({ type: "kick", targetId });
+            return;
+          }
+          setPlayers((p) => p.filter((x) => x.id !== targetId));
         }}
       />
     );
@@ -1944,6 +2138,7 @@ export default function App() {
     { k: "한국 기준금리", v: `${getBaseRate(G.year, G.month).toFixed(2)}%`, c: "#22c55e", d: "연 8회 결정" },
     { k: "USD/KRW", v: `₩${comma(exRateNow)}`, c: exMom >= 0 ? "#ef4444" : "#22c55e", d: `전월 대비 ${fp(exMom)}` },
     { k: "위험자산 모멘텀", v: riskOn >= 0 ? "Risk-On" : "Risk-Off", c: riskOn >= 0 ? "#22c55e" : "#ef4444", d: `신호 ${riskOn >= 0 ? "+" : ""}${riskOn.toFixed(2)}` },
+    { k: "현재 시장 레짐", v: G.marketPhase?.name || "중립", c: G.marketPhase ? "#f59e0b" : "#94a3b8", d: G.marketPhase ? `${G.marketPhase.leftMonths}개월 남음` : "레짐 없음" },
     { k: "레어 이벤트 위험도", v: `${((RARE_EVENTS.reduce((s, x) => s + x.chance, 0)) * 100).toFixed(2)}%/월`, c: "#c084fc", d: "대공황/핵전쟁 포함" },
   ];
 
@@ -2521,6 +2716,47 @@ export default function App() {
                   >
                     매수
                   </button>
+                  {(() => {
+                    const owned = G.stocks.find((x) => x.id === s.id);
+                    if (!owned) return null;
+                    return (
+                      <div style={{ ...S.row, justifyContent: "flex-end", marginTop: 6 }}>
+                        <button
+                          style={S.chipBtn}
+                          onClick={() =>
+                            setG((p) => {
+                              const idx = p.stocks.findIndex((x) => x.id === s.id);
+                              if (idx < 0) return p;
+                              const cur = p.stocks[idx].cur;
+                              const shares = p.stocks[idx].shares;
+                              const q = Math.max(1, Math.floor(shares * 0.25));
+                              return {
+                                ...p,
+                                cash: p.cash + cur * q,
+                                stocks: p.stocks.map((x, i) => (i === idx ? { ...x, shares: x.shares - q } : x)).filter((x) => x.shares > 0),
+                              };
+                            })
+                          }
+                        >
+                          25% 매도
+                        </button>
+                        <button
+                          style={S.btnDanger}
+                          onClick={() =>
+                            setG((p) => {
+                              const idx = p.stocks.findIndex((x) => x.id === s.id);
+                              if (idx < 0) return p;
+                              const cur = p.stocks[idx].cur;
+                              const shares = p.stocks[idx].shares;
+                              return { ...p, cash: p.cash + cur * shares, stocks: p.stocks.filter((_, i) => i !== idx) };
+                            })
+                          }
+                        >
+                          전량매도
+                        </button>
+                      </div>
+                    );
+                  })()}
                 </div>
               </div>
             ))}
