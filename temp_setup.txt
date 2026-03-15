@@ -1,0 +1,73 @@
+function Setup({ onStart, onContinue, canContinue }) {
+  const [cash, setCash] = useState("1");
+  const [unit, setUnit] = useState("억원");
+  const [mode, setMode] = useState("single");
+  const [nickname, setNickname] = useState("플레이어");
+  const [endYear, setEndYear] = useState(2041);
+  const [pauseLimit, setPauseLimit] = useState(3);
+  const [fillBots, setFillBots] = useState(true);
+  const [customMode, setCustomMode] = useState(false);
+  const units = { 만원: 1e4, 천만원: 1e7, 억원: 1e8, 십억원: 1e9 };
+  const startCash = clamp((parseFloat(cash || "0") || 1) * units[unit], 1e6, 1e13);
+  const approxDays = Math.max(30, (endYear - 2026) * 365 + 295);
+  const oneXMin = Math.round((approxDays * 1.6) / 60);
+  return (
+    <div style={S.bgCenter}>
+      <div style={S.card}>
+        <h1 style={S.h1}>비트코인 타이쿤</h1>
+        <input value={nickname} onChange={(e) => setNickname(e.target.value.slice(0, 12) || "플레이어")} placeholder="닉네임" style={S.input} />
+        <div style={S.row}>
+          <input value={cash} onChange={(e) => setCash(e.target.value)} style={S.input} />
+          <select value={unit} onChange={(e) => setUnit(e.target.value)} style={S.select}>
+            {Object.keys(units).map((u) => (
+              <option key={u}>{u}</option>
+            ))}
+          </select>
+        </div>
+        <p style={S.muted}>시작 자본 {fw(startCash)}</p>
+        <div style={S.row}>
+          <span style={S.muted}>종료 연도</span>
+          <select value={endYear} onChange={(e) => setEndYear(parseInt(e.target.value, 10))} style={S.select}>
+            {Array.from({ length: 20 }, (_, i) => 2028 + i).map((y) => (
+              <option key={y} value={y}>{y}</option>
+            ))}
+          </select>
+          <span style={S.muted}>1배속 예상 약 {oneXMin}분</span>
+        </div>
+        <div style={S.row}>
+          <button style={mode === "single" ? S.btnPri : S.speed} onClick={() => setMode("single")}>싱글</button>
+          <button style={mode === "multi" ? S.btnPri : S.speed} onClick={() => setMode("multi")}>멀티(로컬)</button>
+        </div>
+        {mode === "multi" && (
+          <div style={{ ...S.card, background: "#0b1220", borderColor: "#334155" }}>
+            <label style={S.muted}>
+              <input type="checkbox" checked={fillBots} onChange={(e) => setFillBots(e.target.checked)} /> AI로 빈자리 채우기
+            </label>
+            <label style={S.muted}>
+              <input type="checkbox" checked={customMode} onChange={(e) => setCustomMode(e.target.checked)} /> 친구 커스텀모드(서버 연동)
+            </label>
+            <div style={S.row}>
+              <span style={S.muted}>개인 일시정지 횟수</span>
+              <select value={pauseLimit} onChange={(e) => setPauseLimit(parseInt(e.target.value, 10))} style={S.select}>
+                {[1, 2, 3, 4, 5].map((n) => (
+                  <option key={n} value={n}>{n}회</option>
+                ))}
+              </select>
+            </div>
+            {customMode && <div style={{ ...S.muted, color: "#f59e0b" }}>친구 멀티는 실시간 동기화를 위해 서버(WebSocket/Supabase)가 필요합니다.</div>}
+          </div>
+        )}
+        <button style={S.btnPri} onClick={() => onStart({ startCash, mode, nickname: nickname || "플레이어", endYear, pauseLimit, fillBots, customMode })}>
+          게임 시작
+        </button>
+        <div style={S.muted}>종료연도/일시정지/멀티옵션은 게임 시작 시 반영됩니다.</div>
+        {canContinue && (
+          <button style={S.speed} onClick={onContinue}>
+            이어하기
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
