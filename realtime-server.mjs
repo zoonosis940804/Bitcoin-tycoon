@@ -1,9 +1,18 @@
-import { WebSocketServer } from "ws";
+﻿import { WebSocketServer } from "ws";
 
 const PORT = Number(process.env.PORT || process.env.RT_PORT || 8787);
 const wss = new WebSocketServer({ port: PORT });
 
 const rooms = new Map();
+const clients = new Set();
+
+function makeRoomCode() {
+  let code = "";
+  do {
+    code = `BTC${Math.floor(1000 + Math.random() * 9000)}`;
+  } while (rooms.has(code));
+  return code;
+}
 
 function getRoom(code) {
   if (!rooms.has(code)) {
@@ -20,6 +29,39 @@ function getRoom(code) {
     });
   }
   return rooms.get(code);
+}
+
+function roomListView() {
+  return [...rooms.values()]
+    .map((r) => ({
+      code: r.code,
+      players: r.players.length,
+      started: !!r.started,
+      hostNickname: r.players.find((p) => p.id === r.hostId)?.nickname || "-",
+      joinable: !r.started,
+      endYear: r.endYear,
+      pauseLimit: r.pauseLimit,
+      speed: r.speed || 1,
+    }))
+    .sort((a, b) => {
+      if (a.joinable !== b.joinable) return a.joinable ? -1 : 1;
+      return b.players - a.players;
+    });
+}
+
+function sendRoomList(ws) {
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(
+    JSON.stringify({
+      type: "rooms_list",
+      rooms: roomListView(),
+      ts: Date.now(),
+    }),
+  );
+}
+
+function broadcastRoomList() {
+  clients.forEach((c) => sendRoomList(c));
 }
 
 function broadcast(room, msg) {
@@ -50,7 +92,11 @@ function roomView(room) {
 }
 
 wss.on("connection", (ws) => {
+  clients.add(ws);
+  sendRoomList(ws);
+
   let joined = null;
+
   ws.on("message", (buf) => {
     let data = null;
     try {
@@ -60,14 +106,39 @@ wss.on("connection", (ws) => {
     }
     if (!data || !data.type) return;
 
+    if (data.type === "list_rooms") {
+      sendRoomList(ws);
+      return;
+    }
+
     if (data.type === "join") {
-      const code = String(data.roomCode || "PUBLIC").toUpperCase();
+      const requested = String(data.roomCode || "")
+        .toUpperCase()
+        .replace(/[^A-Z0-9]/g, "")
+        .slice(0, 12);
+      const code = requested || makeRoomCode();
       const id = String(data.clientId || `u_${Date.now()}`);
-      const nickname = String(data.nickname || "플레이어");
+      const nickname = String(data.nickname || "Player").slice(0, 20);
       const room = getRoom(code);
-      room.pauseLimit = Number(data.pauseLimit || room.pauseLimit || 3);
-      room.endYear = Number(data.endYear || room.endYear || 2041);
-      room.startCash = Number(data.startCash || room.startCash || 100000000);
+      const isNewRoom = room.players.length === 0;
+
+      if (isNewRoom) {
+        room.pauseLimit = Number(data.pauseLimit || room.pauseLimit || 3);
+        room.endYear = Number(data.endYear || room.endYear || 2041);
+        room.startCash = Number(data.startCash || room.startCash || 100000000);
+        room.speed = [1, 2, 4, 10, 20].includes(Number(data.speed)) ? Number(data.speed) : room.speed || 1;
+      }
+
+      if (room.started && !room.players.find((p) => p.id === id)) {
+        ws.send(
+          JSON.stringify({
+            type: "join_failed",
+            reason: "이미 시작된 방입니다. 다른 대기실을 선택하세요.",
+          }),
+        );
+        sendRoomList(ws);
+        return;
+      }
 
       if (!room.hostId) room.hostId = id;
       room.players = room.players.filter((p) => p.id !== id);
@@ -80,6 +151,7 @@ wss.on("connection", (ws) => {
       });
       joined = { code, id };
       broadcast(room, { type: "room_state", room: roomView(room) });
+      broadcastRoomList();
       return;
     }
 
@@ -100,6 +172,7 @@ wss.on("connection", (ws) => {
       room.started = true;
       room.pausedBy = null;
       broadcast(room, { type: "start_game", room: roomView(room) });
+      broadcastRoomList();
       return;
     }
 
@@ -117,6 +190,7 @@ wss.on("connection", (ws) => {
         room.speed = ok;
       }
       broadcast(room, { type: "room_state", room: roomView(room) });
+      broadcastRoomList();
       return;
     }
 
@@ -132,6 +206,7 @@ wss.on("connection", (ws) => {
       } catch (_e) {}
       room.players = room.players.filter((p) => p.id !== targetId);
       broadcast(room, { type: "room_state", room: roomView(room) });
+      broadcastRoomList();
       return;
     }
 
@@ -154,16 +229,25 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("close", () => {
-    if (!joined) return;
+    clients.delete(ws);
+    if (!joined) {
+      broadcastRoomList();
+      return;
+    }
     const room = rooms.get(joined.code);
-    if (!room) return;
+    if (!room) {
+      broadcastRoomList();
+      return;
+    }
     room.players = room.players.filter((p) => p.id !== joined.id);
     if (room.hostId === joined.id) room.hostId = room.players[0]?.id || null;
     if (room.players.length === 0) {
       rooms.delete(joined.code);
+      broadcastRoomList();
       return;
     }
     broadcast(room, { type: "room_state", room: roomView(room) });
+    broadcastRoomList();
   });
 });
 

@@ -1014,7 +1014,7 @@ function evaluateUnlocks(game) {
   };
 }
 
-function Setup({ onStart, onContinue, canContinue }) {
+function Setup({ onStart, onContinue, canContinue, roomList = [], roomListLoading = false, roomListConnected = false, onRefreshRooms }) {
   const [cash, setCash] = useState("1");
   const [unit, setUnit] = useState("억원");
   const [mode, setMode] = useState("single");
@@ -1022,12 +1022,12 @@ function Setup({ onStart, onContinue, canContinue }) {
   const [endYear, setEndYear] = useState(2041);
   const [pauseLimit, setPauseLimit] = useState(3);
   const [fillBots, setFillBots] = useState(true);
-  const [customMode, setCustomMode] = useState(false);
-  const [roomCode, setRoomCode] = useState("ROOM1");
+  const [roomCode, setRoomCode] = useState("");
   const units = { 만원: 1e4, 천만원: 1e7, 억원: 1e8, 십억원: 1e9 };
   const startCash = clamp((parseFloat(cash || "0") || 1) * units[unit], 1e6, 1e13);
   const approxDays = Math.max(30, (endYear - 2026) * 365 + 295);
   const oneXMin = Math.round((approxDays * 3.5) / 60);
+  const selectedRoom = useMemo(() => roomList.find((r) => r.code === roomCode), [roomList, roomCode]);
   return (
     <div style={S.bgCenter}>
       <div style={S.card}>
@@ -1061,9 +1061,6 @@ function Setup({ onStart, onContinue, canContinue }) {
             <label style={S.muted}>
               <input type="checkbox" checked={fillBots} onChange={(e) => setFillBots(e.target.checked)} /> AI로 빈자리 채우기
             </label>
-            <label style={S.muted}>
-              <input type="checkbox" checked={customMode} onChange={(e) => setCustomMode(e.target.checked)} /> 친구 커스텀모드(서버 연동)
-            </label>
             <div style={S.row}>
               <span style={S.muted}>개인 일시정지 횟수</span>
               <select value={pauseLimit} onChange={(e) => setPauseLimit(parseInt(e.target.value, 10))} style={S.select}>
@@ -1072,40 +1069,64 @@ function Setup({ onStart, onContinue, canContinue }) {
                 ))}
               </select>
             </div>
-            {customMode && (
-              <>
-                <input value={roomCode} onChange={(e) => setRoomCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 12))} placeholder="방 코드" style={S.input} />
-                <div style={S.row}>
+            <div style={{ ...S.card, background: "#020617", borderColor: "#334155", padding: 8, gap: 6 }}>
+              <div style={{ ...S.row, justifyContent: "space-between", alignItems: "center" }}>
+                <div style={{ ...S.muted, color: "#93c5fd", fontWeight: 700 }}>
+                  공개 대기실 {roomListConnected ? `(${roomList.length}개)` : "(연결중)"}
+                </div>
+                <button style={S.chipBtn} onClick={() => onRefreshRooms?.()} disabled={!roomListConnected}>
+                  {roomListLoading ? "새로고침..." : "새로고침"}
+                </button>
+              </div>
+              <div style={{ maxHeight: 180, overflowY: "auto", display: "flex", flexDirection: "column", gap: 6 }}>
+                {roomList.length === 0 && (
+                  <div style={{ ...S.muted, color: roomListConnected ? "#94a3b8" : "#f59e0b" }}>
+                    {roomListConnected ? "열린 대기실이 없습니다. 새 방으로 시작하세요." : "멀티 서버 연결 상태를 확인 중입니다."}
+                  </div>
+                )}
+                {roomList.map((r) => (
                   <button
-                    style={S.chipBtn}
-                    onClick={() => setRoomCode(`BTC${Math.floor(1000 + Math.random() * 9000)}`)}
-                  >
-                    랜덤 코드
-                  </button>
-                  <button
-                    style={S.chipBtn}
+                    key={r.code}
+                    style={{
+                      ...S.item,
+                      cursor: r.joinable ? "pointer" : "not-allowed",
+                      borderColor: roomCode === r.code ? "#22c55e" : r.joinable ? "#334155" : "#7f1d1d",
+                      opacity: r.joinable ? 1 : 0.55,
+                      textAlign: "left",
+                    }}
                     onClick={() => {
-                      try {
-                        navigator.clipboard?.writeText(roomCode || "ROOM1");
-                      } catch (_e) {}
+                      if (!r.joinable) return;
+                      setRoomCode(r.code);
                     }}
                   >
-                    코드 복사
+                    <span>
+                      <strong style={{ color: r.joinable ? "#22c55e" : "#ef4444" }}>{r.code}</strong>
+                      <span style={{ ...S.muted, marginLeft: 8 }}>방장 {r.hostNickname}</span>
+                    </span>
+                    <span style={S.muted}>
+                      {r.players}명 · {r.joinable ? "입장 가능" : "게임 진행중"}
+                    </span>
                   </button>
-                </div>
-                <div style={{ ...S.muted, color: "#f59e0b" }}>서버 주소는 자동 적용됩니다. 같은 roomCode로 친구 접속</div>
-                <div style={{ ...S.muted, color: "#93c5fd" }}>WS: {DEFAULT_WS_URL}</div>
-                <div style={{ ...S.card, background: "#020617", borderColor: "#334155", padding: 8 }}>
-                  <div style={{ ...S.muted, color: "#93c5fd" }}>친구 빠른 시작</div>
-                  <div style={S.muted}>1) 모드: 멀티 + 커스텀모드 ON</div>
-                  <div style={S.muted}>2) 방장만 방 코드 생성 후 공유</div>
-                  <div style={S.muted}>3) 친구는 같은 코드 입력 후 준비 → 시작</div>
-                </div>
-              </>
-            )}
+                ))}
+              </div>
+              <div style={S.row}>
+                <button style={S.chipBtn} onClick={() => setRoomCode("")}>
+                  새 방 만들기
+                </button>
+                <input
+                  value={roomCode}
+                  onChange={(e) => setRoomCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 12))}
+                  placeholder="직접 방코드 입력 (선택)"
+                  style={{ ...S.input, minWidth: 180 }}
+                />
+              </div>
+              <div style={{ ...S.muted, color: "#93c5fd" }}>
+                {roomCode ? `선택된 방: ${roomCode}${selectedRoom ? ` · 현재 ${selectedRoom.players}명` : " (신규 생성 가능)"}` : "새 방으로 시작합니다."}
+              </div>
+            </div>
           </div>
         )}
-        <button style={S.btnPri} onClick={() => onStart({ startCash, mode, nickname: nickname || "익명 트레이더", endYear, pauseLimit, fillBots, customMode, roomCode })}>
+        <button style={S.btnPri} onClick={() => onStart({ startCash, mode, nickname: nickname || "익명 트레이더", endYear, pauseLimit, fillBots, customMode: mode === "multi", roomCode })}>
           게임 시작
         </button>
         <div style={S.muted}>종료연도/일시정지/멀티옵션은 게임 시작 시 반영됩니다.</div>
@@ -1135,7 +1156,10 @@ function Lobby({ players, roomState, onReady, onStart, onBack, onApplySettings, 
     <div style={S.bgCenter}>
       <div style={{ ...S.card, width: 560, maxWidth: "100%" }}>
         <h2 style={{ marginTop: 0, color: "#22c55e" }}>멀티 로비</h2>
-        <div style={{ ...S.muted, marginBottom: 10 }}>준비 후 시작</div>
+        <div style={{ ...S.row, justifyContent: "space-between", marginBottom: 10 }}>
+          <div style={S.muted}>준비 후 시작</div>
+          <div style={{ ...S.muted, color: "#93c5fd", fontWeight: 700 }}>ROOM: {roomState?.code || "-"}</div>
+        </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 12 }}>
           {players.map((p) => (
             <div key={p.id} style={S.item}>
@@ -1354,6 +1378,8 @@ function BinanceCandleChart({ candles, tf = "1D", h = 220, skin = "binance" }) {
 
 export default function App() {
   const wsRef = useRef(null);
+  const setupWsRef = useRef(null);
+  const setupWsRetryRef = useRef(null);
   const clientIdRef = useRef(`c_${Date.now()}_${Math.floor(Math.random() * 9999)}`);
   const [screen, setScreen] = useState("setup");
   const [run, setRun] = useState(false);
@@ -1399,6 +1425,9 @@ export default function App() {
   const [selectedCollectibleId, setSelectedCollectibleId] = useState(null);
   const [roomState, setRoomState] = useState(null);
   const [unlockFx, setUnlockFx] = useState(null);
+  const [roomList, setRoomList] = useState([]);
+  const [roomListLoading, setRoomListLoading] = useState(false);
+  const [roomListConnected, setRoomListConnected] = useState(false);
 
   const btcKrw = useMemo(() => (G ? G.btcUsd * KRW_RATE : 0), [G]);
   const rivalBoard = useMemo(() => {
@@ -1443,6 +1472,92 @@ export default function App() {
     if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg));
   };
 
+  const requestRoomList = useCallback(() => {
+    const ws = setupWsRef.current;
+    if (ws && ws.readyState === 1) {
+      setRoomListLoading(true);
+      ws.send(JSON.stringify({ type: "list_rooms" }));
+    }
+  }, []);
+
+  useEffect(() => {
+    if (screen !== "setup") {
+      if (setupWsRetryRef.current) {
+        clearTimeout(setupWsRetryRef.current);
+        setupWsRetryRef.current = null;
+      }
+      if (setupWsRef.current) {
+        try {
+          setupWsRef.current.close();
+        } catch (_e) {}
+      }
+      setupWsRef.current = null;
+      setRoomListConnected(false);
+      setRoomListLoading(false);
+      return;
+    }
+
+    let closed = false;
+    const connect = () => {
+      if (closed || screen !== "setup") return;
+      if (setupWsRef.current && setupWsRef.current.readyState <= 1) {
+        requestRoomList();
+        return;
+      }
+      setRoomListLoading(true);
+      const ws = new WebSocket(DEFAULT_WS_URL);
+      setupWsRef.current = ws;
+      ws.onopen = () => {
+        if (closed) return;
+        setRoomListConnected(true);
+        setRoomListLoading(true);
+        ws.send(JSON.stringify({ type: "list_rooms" }));
+      };
+      ws.onmessage = (ev) => {
+        if (closed) return;
+        let m = null;
+        try {
+          m = JSON.parse(ev.data);
+        } catch (_e) {
+          return;
+        }
+        if (m?.type === "rooms_list") {
+          setRoomList(Array.isArray(m.rooms) ? m.rooms : []);
+          setRoomListLoading(false);
+        }
+      };
+      ws.onerror = () => {
+        if (closed) return;
+        setRoomListConnected(false);
+      };
+      ws.onclose = () => {
+        if (closed) return;
+        setupWsRef.current = null;
+        setRoomListConnected(false);
+        setRoomListLoading(false);
+        if (screen === "setup") {
+          if (setupWsRetryRef.current) clearTimeout(setupWsRetryRef.current);
+          setupWsRetryRef.current = setTimeout(() => connect(), 1500);
+        }
+      };
+    };
+
+    connect();
+    return () => {
+      closed = true;
+      if (setupWsRetryRef.current) {
+        clearTimeout(setupWsRetryRef.current);
+        setupWsRetryRef.current = null;
+      }
+      if (setupWsRef.current) {
+        try {
+          setupWsRef.current.close();
+        } catch (_e) {}
+      }
+      setupWsRef.current = null;
+    };
+  }, [screen, requestRoomList]);
+
   useEffect(() => {
     if (!multi?.enabled || !multi?.customMode || !multi?.serverUrl || (screen !== "lobby" && screen !== "game")) return;
     if (wsRef.current && wsRef.current.readyState <= 1) return;
@@ -1452,12 +1567,13 @@ export default function App() {
       toastPush(`멀티 서버 연결됨 (${multi.serverUrl.replace(/^wss?:\/\//, "")})`, "good", 1);
       sendWs({
         type: "join",
-        roomCode: multi.roomCode || "ROOM1",
+        roomCode: multi.roomCode || "",
         clientId: clientIdRef.current,
         nickname: multi.nickname || "플레이어",
         startCash: G?.startCash || 100000000,
         pauseLimit: multi.pauseLimit || 3,
         endYear: G?.endYear || 2041,
+        speed: spd || 1,
       });
     };
     ws.onmessage = (ev) => {
@@ -1470,6 +1586,7 @@ export default function App() {
       if (!m) return;
       if (m.type === "room_state" && m.room) {
         setRoomState(m.room);
+        setMulti((prev) => (prev && prev.enabled ? { ...prev, roomCode: m.room.code || prev.roomCode } : prev));
         setPlayers(
           (m.room.players || []).map((p) => ({
             id: p.id,
@@ -1489,6 +1606,17 @@ export default function App() {
           if (typeof m.room.speed === "number") setSpd(m.room.speed);
           setG((prev) => (prev ? { ...prev, endYear: m.room.endYear || prev.endYear, pauseLimit: m.room.pauseLimit || prev.pauseLimit } : prev));
         }
+      }
+      if (m.type === "rooms_list") {
+        setRoomList(Array.isArray(m.rooms) ? m.rooms : []);
+      }
+      if (m.type === "join_failed") {
+        toastPush(m.reason || "방 입장 실패", "bad", 3);
+        setRun(false);
+        setScreen("setup");
+        setMulti(null);
+        setPlayers([]);
+        setRoomState(null);
       }
       if (m.type === "start_game") {
         if (m.room) {
@@ -1528,7 +1656,7 @@ export default function App() {
       if (wsRef.current) wsRef.current.close();
       wsRef.current = null;
     };
-  }, [multi, screen, toastPush]);
+  }, [multi, screen, toastPush, spd, G?.startCash, G?.endYear]);
 
   useEffect(() => {
     if (!G || screen !== "game") return;
@@ -2281,6 +2409,10 @@ export default function App() {
     return (
       <Setup
         canContinue={!!savedGame}
+        roomList={roomList}
+        roomListLoading={roomListLoading}
+        roomListConnected={roomListConnected}
+        onRefreshRooms={requestRoomList}
         onContinue={() => {
           if (!savedGame) return;
           const g2 = normalizeGame(savedGame);
@@ -2329,7 +2461,7 @@ export default function App() {
             const bots = fillBots ? makeBots(customMode ? 0 : 5, startCash).map((b) => ({ ...b, pauseLeft: 0 })) : [];
             setPlayers([me, ...bots]);
             setMulti({ enabled: true, nickname, fillBots, customMode, pauseLimit, roomCode, serverUrl: DEFAULT_WS_URL });
-            setRoomState({ endYear, pauseLimit, speed: 1, players: [me, ...bots], hostId: me.id });
+            setRoomState({ code: roomCode || null, endYear, pauseLimit, speed: 1, players: [me, ...bots], hostId: me.id });
             setScreen("lobby");
           } else {
             setPlayers([]);
