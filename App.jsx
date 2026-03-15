@@ -1032,6 +1032,7 @@ function Setup({ onStart, onContinue, canContinue }) {
     <div style={S.bgCenter}>
       <div style={S.card}>
         <h1 style={S.h1}>비트코인 타이쿤</h1>
+        <div style={{ ...S.muted, color: "#93c5fd" }}>WS: {DEFAULT_WS_URL}</div>
         <input value={nickname} onChange={(e) => setNickname(e.target.value.slice(0, 12))} placeholder="트레이더 닉네임" style={S.input} />
         <div style={S.row}>
           <input value={cash} onChange={(e) => setCash(e.target.value)} style={S.input} />
