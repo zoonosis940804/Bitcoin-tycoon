@@ -3,10 +3,14 @@ import { BTC_RET_REAL } from "./btcReturns";
 
 const KRW_RATE = 1473;
 const MONTHLY_SALARY = 3_000_000;
+const ENV_WS_URL = typeof import.meta !== "undefined" ? import.meta?.env?.VITE_RT_WS_URL : "";
 const DEFAULT_WS_URL =
-  typeof window !== "undefined" && (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1")
-    ? "ws://127.0.0.1:8787"
-    : "wss://bitcoin-tycoon-rt.onrender.com";
+  ENV_WS_URL ||
+  (
+    typeof window !== "undefined" && (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1")
+      ? "ws://127.0.0.1:8787"
+      : "wss://bitcoin-tycoon-rt.onrender.com"
+  );
 const MO = ["1월", "2월", "3월", "4월", "5월", "6월", "7월", "8월", "9월", "10월", "11월", "12월"];
 const DIM = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 
@@ -756,6 +760,45 @@ const APTS_WITH_AREA = APTS.map((a) => {
   const area = APT_AREA_OVERRIDES[a.id] || { sqm: 84, py: 25.4 };
   return { ...a, sqm: area.sqm, py: area.py };
 });
+const APT_REGION_BY_ID = {
+  banpo: "서울",
+  jamsil: "서울",
+  daechi: "서울",
+  dogok: "서울",
+  raemian1: "서울",
+  yongsan: "서울",
+  mapo: "서울",
+  mokdong: "서울",
+  hannam: "서울",
+  nowon: "서울",
+  seongbuk: "서울",
+  guro_officetel: "서울",
+  pangyo: "수도권",
+  songdo: "수도권",
+  dongtan: "수도권",
+  gwanggyo: "수도권",
+  sejong: "수도권",
+  gimpo: "수도권",
+  ansan_small: "수도권",
+  incheon_villa: "수도권",
+  haeundae: "지방",
+  jeju: "지방",
+  suseong: "지방",
+  cheonan: "지방",
+  gwangju: "지방",
+  daegu_villa: "지방",
+  busan_villa: "지방",
+  cheongju_villa: "지방",
+};
+const aptRegionOf = (id) => APT_REGION_BY_ID[id] || "지방";
+const aptTypeOf = (a) => (/빌라|오피스텔/.test(a.name) ? "빌라/오피스텔" : "아파트");
+const matchAptFilters = (a, regionFilter, typeFilter) => {
+  const r = aptRegionOf(a.id);
+  const t = aptTypeOf(a);
+  const okRegion = regionFilter === "전체" ? true : r === regionFilter;
+  const okType = typeFilter === "전체" ? true : t === typeFilter;
+  return okRegion && okType;
+};
 
 const STOCKS = [
   { id: "qqq", name: "QQQ", icon: "💡", p: 593.72 * KRW_RATE, g: 0.012, divYield: 0, etfDesc: "나스닥100" },
@@ -793,6 +836,31 @@ const STOCKS = [
   { id: "lg_energy", name: "LG에너지솔루션", icon: "🔋", p: 438000, g: 0.011, divYield: 0.005 },
   { id: "celltrion", name: "셀트리온", icon: "🧪", p: 189000, g: 0.009, divYield: 0.006 },
 ];
+const KR_STOCK_IDS = new Set(["samsung", "skhynix", "hyundai", "naver", "kakao", "kodex200", "kosdaq", "hanaro_reit", "kb_fin", "lg_energy", "celltrion"]);
+const isDomesticStock = (s) => KR_STOCK_IDS.has(s.id);
+const isBondStock = (s) => s.id === "tlt" || /채권|국채/.test(s.etfDesc || "");
+const isEtfStock = (s) => !!s.etfDesc;
+const isDividendStock = (s) => (s.divYield || 0) >= 0.025 || ["schd", "jepi", "hanaro_reit"].includes(s.id);
+const isSingleStock = (s) => !isEtfStock(s);
+const matchStockFilters = (s, marketFilter, typeFilter) => {
+  const okMarket =
+    marketFilter === "전체"
+      ? true
+      : marketFilter === "국내"
+        ? isDomesticStock(s)
+        : !isDomesticStock(s);
+  const okType =
+    typeFilter === "전체"
+      ? true
+      : typeFilter === "ETF"
+        ? isEtfStock(s)
+        : typeFilter === "개별주"
+          ? isSingleStock(s)
+          : typeFilter === "배당주"
+            ? isDividendStock(s)
+            : isBondStock(s);
+  return okMarket && okType;
+};
 
 const COMMODITIES = [
   { id: "gold", name: "금 (현물 ETF)", icon: "🥇", p: 460.84 * KRW_RATE, g: 0.004, vol: 0.006, etf: "GLD" },
@@ -1025,6 +1093,7 @@ function Setup({ onStart, onContinue, canContinue }) {
                   </button>
                 </div>
                 <div style={{ ...S.muted, color: "#f59e0b" }}>서버 주소는 자동 적용됩니다. 같은 roomCode로 친구 접속</div>
+                <div style={{ ...S.muted, color: "#93c5fd" }}>WS: {DEFAULT_WS_URL}</div>
                 <div style={{ ...S.card, background: "#020617", borderColor: "#334155", padding: 8 }}>
                   <div style={{ ...S.muted, color: "#93c5fd" }}>친구 빠른 시작</div>
                   <div style={S.muted}>1) 모드: 멀티 + 커스텀모드 ON</div>
@@ -1119,7 +1188,7 @@ function TabButton({ active, onClick, children }) {
 
 function aggregateCandles(candles, tf) {
   if (!candles || candles.length < 2) return [];
-  if (tf === "1D") return candles.slice(-120);
+  if (tf === "1D") return [...candles];
   const parse = (k) => {
     const [y, m, d] = String(k).split("-").map((v) => parseInt(v, 10));
     return { y: y || 0, m: m || 1, d: d || 1 };
@@ -1138,7 +1207,7 @@ function aggregateCandles(candles, tf) {
         c: last.c,
       });
     }
-    return out.slice(-80);
+    return out;
   }
   const map = new Map();
   candles.forEach((c) => {
@@ -1159,84 +1228,126 @@ function aggregateCandles(candles, tf) {
       c: last.c,
     });
   });
-  return out.slice(-60);
+  return out;
 }
 
 function BinanceCandleChart({ candles, tf = "1D", h = 220, skin = "binance" }) {
   const data = aggregateCandles(candles, tf);
+  const windowSize = tf === "1D" ? 72 : tf === "1W" ? 64 : 48;
+  const [offset, setOffset] = useState(0);
+  const dragRef = useRef({ active: false, x: 0, carry: 0 });
+  const maxOffset = Math.max(0, data.length - windowSize);
+
+  useEffect(() => {
+    setOffset((v) => Math.min(v, maxOffset));
+  }, [maxOffset, tf, data.length]);
+
+  const start = Math.max(0, data.length - windowSize - offset);
+  const view = data.slice(start, start + windowSize);
+
   if (!data || data.length < 2) {
     return <div style={{ ...S.muted, textAlign: "center", padding: 14 }}>차트 데이터 수집 중...</div>;
+  }
+  if (!view || view.length < 2) {
+    return <div style={{ ...S.muted, textAlign: "center", padding: 14 }}>차트 탐색 데이터가 부족합니다.</div>;
   }
   const sk = CHART_SKINS[skin] || CHART_SKINS.binance;
   const W = 120;
   const PLOT_R = 86;
   const PLOT_L = 2;
   const CH = 80;
-  const vals = data.flatMap((c) => [c.h, c.l]);
+  const vals = view.flatMap((c) => [c.h, c.l]);
   const max = Math.max(...vals);
   const min = Math.min(...vals);
   const range = max - min || 1;
   const py = (v) => CH - ((v - min) / range) * CH;
-  const candleW = Math.max(0.2, 74 / data.length);
+  const candleW = Math.max(0.2, 74 / view.length);
   const parse = (k) => {
     const [y, m, d] = String(k).split("-").map((v) => parseInt(v, 10));
     return { y: y || 0, m: m || 1, d: d || 1 };
   };
-  const labelStep = Math.max(1, Math.floor(data.length / 6));
+  const labelStep = Math.max(1, Math.floor(view.length / 6));
   const yTicks = 6;
   const xTicks = 6;
-  const last = data[data.length - 1];
+  const last = view[view.length - 1];
   const lastUp = last.c >= last.o;
-  const lastPx = fw(last.c * KRW_RATE);
+  const canGoOlder = offset < maxOffset;
+  const canGoNewer = offset > 0;
+  const handleWheel = (e) => {
+    e.preventDefault();
+    const step = Math.max(1, Math.round(Math.abs(e.deltaY) / 38));
+    if (e.deltaY > 0) setOffset((v) => Math.min(maxOffset, v + step));
+    else setOffset((v) => Math.max(0, v - step));
+  };
+  const onDown = (e) => {
+    dragRef.current.active = true;
+    dragRef.current.x = e.clientX;
+    dragRef.current.carry = 0;
+  };
+  const onMove = (e) => {
+    if (!dragRef.current.active) return;
+    const dx = e.clientX - dragRef.current.x;
+    dragRef.current.x = e.clientX;
+    dragRef.current.carry += dx;
+    const unit = 7;
+    if (Math.abs(dragRef.current.carry) < unit) return;
+    const steps = Math.trunc(Math.abs(dragRef.current.carry) / unit);
+    dragRef.current.carry -= Math.sign(dragRef.current.carry) * steps * unit;
+    if (dx > 0) setOffset((v) => Math.min(maxOffset, v + steps));
+    else setOffset((v) => Math.max(0, v - steps));
+  };
+  const onUp = () => {
+    dragRef.current.active = false;
+    dragRef.current.carry = 0;
+  };
   return (
-    <svg viewBox={`0 0 ${W} 100`} preserveAspectRatio="none" style={{ width: "100%", height: h, display: "block", background: sk.bg, borderRadius: 10 }}>
-      {Array.from({ length: yTicks }, (_, i) => 8 + ((CH - 8) / (yTicks - 1)) * i).map((g) => (
-        <line key={`gy_${g}`} x1="0" y1={g} x2={W} y2={g} stroke={sk.grid} strokeWidth="0.32" />
-      ))}
-      {Array.from({ length: xTicks }, (_, i) => i).map((i) => {
-        const x = PLOT_L + (PLOT_R / (xTicks - 1)) * i;
-        return <line key={`gx_${i}`} x1={x} y1="0" x2={x} y2={CH} stroke={sk.grid} strokeWidth="0.22" />;
-      })}
-      {Array.from({ length: yTicks }, (_, i) => i).map((i) => {
-        const val = min + ((yTicks - 1 - i) * range) / (yTicks - 1);
-        const yv = 8 + ((CH - 8) / (yTicks - 1)) * i;
-        return (
-          <text key={`y_${i}`} x={W - 1.1} y={yv - 0.8} textAnchor="end" fill={sk.text} fontSize="2.55">
-            {fw(val * KRW_RATE)}
-          </text>
-        );
-      })}
-      {data.map((c, i) => {
-        const x = PLOT_L + (i / data.length) * PLOT_R;
-        const up = c.c >= c.o;
-        const col = up ? sk.up : sk.down;
-        const yH = py(c.h);
-        const yL = py(c.l);
-        const yO = py(c.o);
-        const yC = py(c.c);
-        const yTop = Math.min(yO, yC);
-        const bodyH = Math.max(0.7, Math.abs(yO - yC));
-        return (
-          <g key={c.k}>
-            <line x1={x + candleW / 2} y1={yH} x2={x + candleW / 2} y2={yL} stroke={col} strokeWidth={Math.max(0.3, candleW * 0.16)} />
-            <rect x={x} y={yTop} width={candleW} height={bodyH} fill={col} />
-            {i % labelStep === 0 && (() => {
-              const dt = parse(c.k);
-              const label = tf === "1M" ? `${String(dt.y).slice(2)}.${String(dt.m).padStart(2, "0")}` : `${dt.m}/${dt.d}`;
-              return <text x={x} y="97.2" fill={sk.text} fontSize="2.85">{label}</text>;
-            })()}
-          </g>
-        );
-      })}
-      <text x={W * 0.5} y={CH * 0.58} textAnchor="middle" fill={sk.text} opacity="0.08" fontSize="9.2" fontWeight="800">
-        {sk.watermark}
-      </text>
-      <line x1={0} y1={py(last.c)} x2={W} y2={py(last.c)} stroke={lastUp ? sk.up : sk.down} strokeWidth="0.28" strokeDasharray="1.6 1.4" opacity="0.8" />
-      <rect x={W - 24} y={py(last.c) - 3.1} width="23.2" height="5.2" rx="1.2" fill={lastUp ? `${sk.up}22` : `${sk.down}22`} stroke={lastUp ? sk.up : sk.down} strokeWidth="0.24" />
-      <text x={W - 12.2} y={py(last.c) + 0.8} textAnchor="middle" fill={lastUp ? sk.up : sk.down} fontSize="2.35" fontWeight="700">
-        {lastPx}
-      </text>
-    </svg>
+    <div
+      style={{ width: "100%", position: "relative", touchAction: "none", userSelect: "none" }}
+      onWheel={handleWheel}
+      onPointerDown={onDown}
+      onPointerMove={onMove}
+      onPointerUp={onUp}
+      onPointerLeave={onUp}
+    >
+      <svg viewBox={`0 0 ${W} 100`} preserveAspectRatio="none" style={{ width: "100%", height: h, display: "block", background: sk.bg, borderRadius: 10 }}>
+        {Array.from({ length: yTicks }, (_, i) => 8 + ((CH - 8) / (yTicks - 1)) * i).map((g) => (
+          <line key={`gy_${g}`} x1="0" y1={g} x2={W} y2={g} stroke={sk.grid} strokeWidth="0.32" />
+        ))}
+        {Array.from({ length: xTicks }, (_, i) => i).map((i) => {
+          const x = PLOT_L + (PLOT_R / (xTicks - 1)) * i;
+          return <line key={`gx_${i}`} x1={x} y1="0" x2={x} y2={CH} stroke={sk.grid} strokeWidth="0.22" />;
+        })}
+        {view.map((c, i) => {
+          const x = PLOT_L + (i / view.length) * PLOT_R;
+          const up = c.c >= c.o;
+          const col = up ? sk.up : sk.down;
+          const yH = py(c.h);
+          const yL = py(c.l);
+          const yO = py(c.o);
+          const yC = py(c.c);
+          const yTop = Math.min(yO, yC);
+          const bodyH = Math.max(0.7, Math.abs(yO - yC));
+          return (
+            <g key={c.k}>
+              <line x1={x + candleW / 2} y1={yH} x2={x + candleW / 2} y2={yL} stroke={col} strokeWidth={Math.max(0.3, candleW * 0.16)} />
+              <rect x={x} y={yTop} width={candleW} height={bodyH} fill={col} />
+              {i % labelStep === 0 && (() => {
+                const dt = parse(c.k);
+                const label = tf === "1M" ? `${String(dt.y).slice(2)}.${String(dt.m).padStart(2, "0")}` : `${dt.m}/${dt.d}`;
+                return <text x={x} y="97.2" fill={sk.text} fontSize="2.85">{label}</text>;
+              })()}
+            </g>
+          );
+        })}
+        <text x={W * 0.5} y={CH * 0.58} textAnchor="middle" fill={sk.text} opacity="0.08" fontSize="9.2" fontWeight="800">
+          {sk.watermark}
+        </text>
+        <line x1={0} y1={py(last.c)} x2={W} y2={py(last.c)} stroke={lastUp ? sk.up : sk.down} strokeWidth="0.28" strokeDasharray="1.6 1.4" opacity="0.8" />
+      </svg>
+      <div style={{ position: "absolute", left: 10, top: 8, fontSize: 11, color: sk.text, opacity: 0.9 }}>
+        {canGoOlder ? "← 과거" : "최초 구간"} · {canGoNewer ? "최신으로 드래그→" : "최신 구간"}
+      </div>
+    </div>
   );
 }
 
@@ -1259,6 +1370,10 @@ export default function App() {
   const [stockQty, setStockQty] = useState({});
   const [aptQty, setAptQty] = useState({});
   const [cmdQty, setCmdQty] = useState({});
+  const [aptRegionFilter, setAptRegionFilter] = useState("전체");
+  const [aptTypeFilter, setAptTypeFilter] = useState("전체");
+  const [stockMarketFilter, setStockMarketFilter] = useState("전체");
+  const [stockTypeFilter, setStockTypeFilter] = useState("전체");
   const [inspectRivalId, setInspectRivalId] = useState(null);
   const [chartTf, setChartTf] = useState("1D");
   const [chartSkin, setChartSkin] = useState("binance");
@@ -1333,6 +1448,7 @@ export default function App() {
     const ws = new WebSocket(multi.serverUrl);
     wsRef.current = ws;
     ws.onopen = () => {
+      toastPush(`멀티 서버 연결됨 (${multi.serverUrl.replace(/^wss?:\/\//, "")})`, "good", 1);
       sendWs({
         type: "join",
         roomCode: multi.roomCode || "ROOM1",
@@ -1401,13 +1517,17 @@ export default function App() {
       }
     };
     ws.onclose = () => {
+      toastPush("멀티 서버 연결 종료", "warn", 1);
       wsRef.current = null;
+    };
+    ws.onerror = () => {
+      toastPush("멀티 서버 연결 실패(주소/배포 상태 확인)", "bad", 3);
     };
     return () => {
       if (wsRef.current) wsRef.current.close();
       wsRef.current = null;
     };
-  }, [multi, screen, G]);
+  }, [multi, screen, toastPush]);
 
   useEffect(() => {
     if (!G || screen !== "game") return;
@@ -1453,7 +1573,7 @@ export default function App() {
       }
       const h = Math.max(Math.max(o, c), hi);
       const l = Math.max(1000, Math.min(Math.min(o, c), lo));
-      return [...prev.slice(-239), { k: key, o, h, l, c }];
+      return [...prev.slice(-4999), { k: key, o, h, l, c }];
     });
   }, [G, screen]);
 
@@ -2285,6 +2405,8 @@ export default function App() {
   const aptVal = G.apts.reduce((sum, a) => sum + a.cur, 0);
   const stVal = G.stocks.reduce((sum, s) => sum + s.cur * s.shares, 0);
   const cmdVal = (G.commodities || []).reduce((sum, c) => sum + c.cur * c.qty, 0);
+  const filteredAptCatalog = APTS_WITH_AREA.filter((a) => matchAptFilters(a, aptRegionFilter, aptTypeFilter));
+  const filteredStockCatalog = STOCKS.filter((s) => matchStockFilters(s, stockMarketFilter, stockTypeFilter));
   const depVal = G.deposits.reduce((sum, d) => sum + d.principal, 0);
   const loanVal = G.loans.reduce((sum, l) => sum + l.principal, 0);
 
@@ -2916,10 +3038,29 @@ export default function App() {
         {tab === "apt" && (
           <div style={S.card}>
             <div style={S.muted}>보유 가치 {fw(aptVal)}</div>
-            {APTS_WITH_AREA.map((a) => (
+            <div style={{ ...S.card, background: "#0b1220", borderColor: "#334155" }}>
+              <div style={S.muted}>지역 필터</div>
+              <div style={S.row}>
+                {["전체", "서울", "수도권", "지방"].map((f) => (
+                  <button key={`apt_r_${f}`} style={{ ...S.speed, ...(aptRegionFilter === f ? S.speedOn : null) }} onClick={() => setAptRegionFilter(f)}>
+                    {f}
+                  </button>
+                ))}
+              </div>
+              <div style={S.muted}>건물 유형 필터</div>
+              <div style={S.row}>
+                {["전체", "아파트", "빌라/오피스텔"].map((f) => (
+                  <button key={`apt_t_${f}`} style={{ ...S.speed, ...(aptTypeFilter === f ? S.speedOn : null) }} onClick={() => setAptTypeFilter(f)}>
+                    {f}
+                  </button>
+                ))}
+              </div>
+              <div style={S.muted}>조건 일치: {filteredAptCatalog.length}개</div>
+            </div>
+            {filteredAptCatalog.map((a) => (
               <div key={a.id} style={S.item}>
                 <div style={{ textAlign: "left", flex: 1, minWidth: 0 }}>
-                  <div>{a.icon || "🏠"} {a.name}</div>
+                  <div>{a.icon || "🏠"} {a.name} <span style={{ ...S.muted, fontSize: 11 }}>({aptRegionOf(a.id)} · {aptTypeOf(a)})</span></div>
                   <div style={S.muted}>{a.sqm}㎡ / {a.py.toFixed(1)}평 · {fw(a.p)}</div>
                   <div style={{ ...S.row, marginTop: 6 }}>
                     {[1, 2, 5, 10].map((n) => (
@@ -2958,6 +3099,7 @@ export default function App() {
                 </div>
               </div>
             ))}
+            {filteredAptCatalog.length === 0 && <div style={S.muted}>필터 조건에 맞는 매물이 없습니다.</div>}
             {G.apts.map((a, idx) => (
               <div key={`${a.id}_${idx}`} style={S.item}>
                 <div style={{ textAlign: "left", flex: 1, minWidth: 0 }}>
@@ -2975,10 +3117,81 @@ export default function App() {
         {tab === "stock" && (
           <div style={S.card}>
             <div style={S.muted}>보유 가치 {fw(stVal)}</div>
-            {STOCKS.map((s) => (
+            <div style={{ ...S.card, background: "#0b1220", borderColor: "#334155" }}>
+              <strong style={{ color: "#cbd5e1" }}>보유 종목</strong>
+              {G.stocks.length === 0 && <div style={S.muted}>보유 주식이 없습니다.</div>}
+              {G.stocks.map((s, idx) => (
+                <div key={`${s.id}_${idx}`} style={S.item}>
+                  <div style={{ textAlign: "left", flex: 1, minWidth: 0 }}>
+                    <div>{s.icon || "📈"} {s.name} {comma(s.shares)}주</div>
+                    <div style={S.muted}>현재 {fw(s.cur * s.shares)}</div>
+                  </div>
+                  <div style={S.row}>
+                    <button
+                      style={S.chipBtn}
+                      onClick={() =>
+                        setG((p) => {
+                          const cur = p.stocks[idx].cur;
+                          const shares = p.stocks[idx].shares;
+                          const q = Math.max(1, Math.floor(shares * 0.25));
+                          return {
+                            ...p,
+                            cash: p.cash + cur * q,
+                            stocks: p.stocks
+                              .map((x, i) => (i === idx ? { ...x, shares: x.shares - q } : x))
+                              .filter((x) => x.shares > 0),
+                          };
+                        })
+                      }
+                    >
+                      25%
+                    </button>
+                    <button
+                      style={S.btnDanger}
+                      onClick={() =>
+                        setG((p) => {
+                          const cur = p.stocks[idx].cur;
+                          const shares = p.stocks[idx].shares;
+                          const cashIn = cur * shares;
+                          return { ...p, cash: p.cash + cashIn, stocks: p.stocks.filter((_, i) => i !== idx) };
+                        })
+                      }
+                    >
+                      전량매도
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div style={{ ...S.card, background: "#0b1220", borderColor: "#334155" }}>
+              <div style={S.muted}>시장 필터</div>
+              <div style={S.row}>
+                {["전체", "국내", "미국"].map((f) => (
+                  <button key={`stk_m_${f}`} style={{ ...S.speed, ...(stockMarketFilter === f ? S.speedOn : null) }} onClick={() => setStockMarketFilter(f)}>
+                    {f}
+                  </button>
+                ))}
+              </div>
+              <div style={S.muted}>유형 필터</div>
+              <div style={S.row}>
+                {["전체", "ETF", "개별주", "배당주", "채권"].map((f) => (
+                  <button key={`stk_t_${f}`} style={{ ...S.speed, ...(stockTypeFilter === f ? S.speedOn : null) }} onClick={() => setStockTypeFilter(f)}>
+                    {f}
+                  </button>
+                ))}
+              </div>
+              <div style={S.muted}>조건 일치: {filteredStockCatalog.length}개</div>
+            </div>
+            {filteredStockCatalog.map((s) => (
               <div key={s.id} style={S.item}>
                 <div style={{ textAlign: "left", flex: 1, minWidth: 0 }}>
-                  <div>{s.icon || "📈"} {s.name} {s.etfDesc && <span style={{ ...S.muted, fontSize: 11 }}>({s.etfDesc})</span>}</div>
+                  <div>
+                    {s.icon || "📈"} {s.name}{" "}
+                    {s.etfDesc && <span style={{ ...S.muted, fontSize: 11 }}>({s.etfDesc})</span>}
+                    <span style={{ ...S.muted, fontSize: 11, marginLeft: 6 }}>
+                      [{isBondStock(s) ? "채권" : isEtfStock(s) ? "ETF" : "개별주"} · {isDomesticStock(s) ? "국내" : "미국"}]
+                    </span>
+                  </div>
                   <div style={S.muted}>{fw(s.p)}</div>
                   <div style={{ ...S.row, marginTop: 6 }}>
                     {[1, 10, 100, 500, 1000].map((n) => (
@@ -3017,48 +3230,7 @@ export default function App() {
                 </div>
               </div>
             ))}
-            {G.stocks.map((s, idx) => (
-              <div key={`${s.id}_${idx}`} style={S.item}>
-                <div style={{ textAlign: "left", flex: 1, minWidth: 0 }}>
-                  <div>{s.icon || "📈"} {s.name} {comma(s.shares)}주</div>
-                  <div style={S.muted}>현재 {fw(s.cur * s.shares)}</div>
-                </div>
-                <div style={S.row}>
-                  <button
-                    style={S.chipBtn}
-                    onClick={() =>
-                      setG((p) => {
-                        const cur = p.stocks[idx].cur;
-                        const shares = p.stocks[idx].shares;
-                        const q = Math.max(1, Math.floor(shares * 0.25));
-                        return {
-                          ...p,
-                          cash: p.cash + cur * q,
-                          stocks: p.stocks
-                            .map((x, i) => (i === idx ? { ...x, shares: x.shares - q } : x))
-                            .filter((x) => x.shares > 0),
-                        };
-                      })
-                    }
-                  >
-                    25%
-                  </button>
-                  <button
-                    style={S.btnDanger}
-                    onClick={() =>
-                      setG((p) => {
-                        const cur = p.stocks[idx].cur;
-                        const shares = p.stocks[idx].shares;
-                        const cashIn = cur * shares;
-                        return { ...p, cash: p.cash + cashIn, stocks: p.stocks.filter((_, i) => i !== idx) };
-                      })
-                    }
-                  >
-                    전량매도
-                  </button>
-                </div>
-              </div>
-            ))}
+            {filteredStockCatalog.length === 0 && <div style={S.muted}>필터 조건에 맞는 종목이 없습니다.</div>}
           </div>
         )}
 
