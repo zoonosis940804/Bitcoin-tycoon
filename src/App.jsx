@@ -253,6 +253,26 @@ function randSigned(seed, ...parts) {
   const v = h32(seed, ...parts) / 0xffffffff;
   return v * 2 - 1;
 }
+function rand01(seed, ...parts) {
+  return h32(seed, ...parts) / 0xffffffff;
+}
+function gaussian(seed, ...parts) {
+  // Deterministic Box-Muller
+  const u1 = Math.max(1e-12, rand01(seed, ...parts, "u1"));
+  const u2 = rand01(seed, ...parts, "u2");
+  return Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+}
+function studentLike(seed, ...parts) {
+  // Heavy-tail approximation: z / sqrt(chi2/df), df≈5
+  const z = gaussian(seed, ...parts, "z");
+  const v1 = gaussian(seed, ...parts, "v1");
+  const v2 = gaussian(seed, ...parts, "v2");
+  const v3 = gaussian(seed, ...parts, "v3");
+  const v4 = gaussian(seed, ...parts, "v4");
+  const v5 = gaussian(seed, ...parts, "v5");
+  const chi = Math.max(1e-9, v1 * v1 + v2 * v2 + v3 * v3 + v4 * v4 + v5 * v5);
+  return z / Math.sqrt(chi / 5);
+}
 function makeScenario(seed) {
   return {
     btcBias: randSigned(seed, "bb") * 0.0009,
@@ -514,6 +534,7 @@ function normalizeGame(raw) {
     btcPrevRet: raw.btcPrevRet ?? 0,
     btcVol: raw.btcVol ?? 0.028,
     btcEps: raw.btcEps ?? 0,
+    btcTrend: raw.btcTrend ?? 0,
     btcRegime: raw.btcRegime ?? "chop",
     btcRegimeLeft: raw.btcRegimeLeft ?? 0,
     endYear: raw.endYear ?? 2041,
@@ -781,7 +802,7 @@ function Setup({ onStart, onContinue, canContinue }) {
   const [cash, setCash] = useState("1");
   const [unit, setUnit] = useState("억원");
   const [mode, setMode] = useState("single");
-  const [nickname, setNickname] = useState("플레이어");
+  const [nickname, setNickname] = useState("");
   const [endYear, setEndYear] = useState(2041);
   const [pauseLimit, setPauseLimit] = useState(3);
   const [fillBots, setFillBots] = useState(true);
@@ -795,7 +816,7 @@ function Setup({ onStart, onContinue, canContinue }) {
     <div style={S.bgCenter}>
       <div style={S.card}>
         <h1 style={S.h1}>비트코인 타이쿤</h1>
-        <input value={nickname} onChange={(e) => setNickname(e.target.value.slice(0, 12) || "플레이어")} placeholder="닉네임" style={S.input} />
+        <input value={nickname} onChange={(e) => setNickname(e.target.value.slice(0, 12))} placeholder="닉네임을 입력하세요" style={S.input} />
         <div style={S.row}>
           <input value={cash} onChange={(e) => setCash(e.target.value)} style={S.input} />
           <select value={unit} onChange={(e) => setUnit(e.target.value)} style={S.select}>
@@ -848,7 +869,7 @@ function Setup({ onStart, onContinue, canContinue }) {
         <div style={S.muted}>종료연도/일시정지/멀티옵션은 게임 시작 시 반영됩니다.</div>
         {canContinue && (
           <button style={S.speed} onClick={onContinue}>
-            이어하기
+            저장 불러오기
           </button>
         )}
       </div>
@@ -1227,32 +1248,35 @@ export default function App() {
       if (last && last.k === key && last.c === G.btcUsd) return prev;
       const prevClose = last ? last.c : G.btcPrev || G.btcUsd;
       const gSeed = G.gameSeed || 1;
-      const gapSeed = randSigned(gSeed, "gap", G.year, G.month, G.day);
-      const gap = (G.btcVol || 0.02) * (0.08 + Math.abs(randSigned(gSeed, "gap2", G.year, G.month, G.day)) * 0.42) * gapSeed;
+      const gapSeed = gaussian(gSeed, "gap", G.year, G.month, G.day);
+      const gap = clamp(gapSeed * (G.btcVol || 0.02) * 0.12, -0.06, 0.06);
       const o = prevClose * (1 + gap);
       const c = G.btcUsd;
-      const absRet = Math.abs(c / (o || 1) - 1);
-      const baseVol = clamp((G.btcVol || 0.02) * (0.45 + Math.abs(randSigned(gSeed, "v1", G.year, G.month, G.day)) * 1.6) + absRet * 0.55, 0.0025, 0.2);
-      const shapeRoll = h32(gSeed, "shape", G.year, G.month, G.day) / 0xffffffff;
-      let upperMul = 1.0;
-      let lowerMul = 1.0;
-      if (shapeRoll < 0.12) {
-        upperMul = 0.18; lowerMul = 0.18; // marubozu 유사
-      } else if (shapeRoll < 0.24) {
-        upperMul = 0.22; lowerMul = 2.4; // hammer
-      } else if (shapeRoll < 0.36) {
-        upperMul = 2.4; lowerMul = 0.22; // inverted hammer / shooting
-      } else if (shapeRoll < 0.50) {
-        upperMul = 1.8; lowerMul = 1.8; // long-legged doji 영역
-      } else if (shapeRoll < 0.66) {
-        upperMul = 0.45; lowerMul = 1.35;
-      } else if (shapeRoll < 0.82) {
-        upperMul = 1.35; lowerMul = 0.45;
+      const baseVol = clamp((G.btcVol || 0.02) * (0.85 + Math.abs(gaussian(gSeed, "iv", G.year, G.month, G.day)) * 0.65), 0.004, 0.22);
+      let hi = Math.max(o, c);
+      let lo = Math.min(o, c);
+      const steps = 18;
+      let px = o;
+      for (let i = 1; i <= steps; i++) {
+        const t = i / steps;
+        const target = o + (c - o) * t;
+        const nz = studentLike(gSeed, "intra", G.year, G.month, G.day, i);
+        px += (target - px) * 0.42 + nz * baseVol * o * 0.22;
+        hi = Math.max(hi, px);
+        lo = Math.min(lo, px);
       }
-      const wickUpSeed = 0.55 + Math.abs(randSigned(gSeed, "wickUp", G.year, G.month, G.day)) * 1.1;
-      const wickDnSeed = 0.55 + Math.abs(randSigned(gSeed, "wickDn", G.year, G.month, G.day)) * 1.1;
-      const h = Math.max(o, c) * (1 + baseVol * upperMul * wickUpSeed);
-      const l = Math.max(1000, Math.min(o, c) * (1 - baseVol * lowerMul * wickDnSeed));
+      // Occasional extra wick spikes to create hammer/inverted/doji-like variety.
+      const spikeRoll = rand01(gSeed, "spike", G.year, G.month, G.day);
+      if (spikeRoll < 0.17) {
+        hi *= 1 + baseVol * (0.25 + rand01(gSeed, "spikeU", G.year, G.month, G.day) * 1.8);
+      } else if (spikeRoll < 0.34) {
+        lo *= 1 - baseVol * (0.25 + rand01(gSeed, "spikeD", G.year, G.month, G.day) * 1.8);
+      } else if (spikeRoll < 0.42) {
+        hi *= 1 + baseVol * (0.18 + rand01(gSeed, "spikeU2", G.year, G.month, G.day) * 1.1);
+        lo *= 1 - baseVol * (0.18 + rand01(gSeed, "spikeD2", G.year, G.month, G.day) * 1.1);
+      }
+      const h = Math.max(Math.max(o, c), hi);
+      const l = Math.max(1000, Math.min(Math.min(o, c), lo));
       return [...prev.slice(-239), { k: key, o, h, l, c }];
     });
     setWealthHist((prev) => {
@@ -1336,59 +1360,72 @@ export default function App() {
         const prevRet = p.btcPrevRet || 0;
         const prevVol = p.btcVol || 0.028;
         const prevEps = p.btcEps || 0;
+        const prevTrend = p.btcTrend || 0;
         let btcRegime = p.btcRegime || "chop";
         let btcRegimeLeft = p.btcRegimeLeft || 0;
+        const regimeTransition = {
+          chop: [
+            ["chop", 0.90], ["bull", 0.04], ["bear", 0.04], ["panic", 0.01], ["squeeze", 0.01],
+          ],
+          bull: [
+            ["bull", 0.92], ["chop", 0.04], ["squeeze", 0.02], ["bear", 0.01], ["panic", 0.01],
+          ],
+          bear: [
+            ["bear", 0.93], ["chop", 0.04], ["panic", 0.02], ["bull", 0.005], ["squeeze", 0.005],
+          ],
+          panic: [
+            ["panic", 0.72], ["bear", 0.20], ["chop", 0.07], ["bull", 0.005], ["squeeze", 0.005],
+          ],
+          squeeze: [
+            ["squeeze", 0.74], ["bull", 0.17], ["chop", 0.07], ["bear", 0.01], ["panic", 0.01],
+          ],
+        };
         if (btcRegimeLeft <= 0) {
-          const r = h32(p.gameSeed || 1, "btc_regime", y, m, d) / 0xffffffff;
-          if (r < 0.16) btcRegime = "bear";
-          else if (r < 0.29) btcRegime = "bull";
-          else if (r < 0.37) btcRegime = "panic";
-          else if (r < 0.45) btcRegime = "squeeze";
-          else btcRegime = "chop";
-          const durMap = {
-            chop: [2, 18],
-            bear: [4, 26],
-            bull: [4, 22],
-            panic: [1, 7],
-            squeeze: [1, 6],
-          };
-          const [lo, hi] = durMap[btcRegime] || [3, 12];
-          const rDur = h32(p.gameSeed || 1, "btc_regime_dur", y, m, d) / 0xffffffff;
-          btcRegimeLeft = lo + Math.floor(rDur * (hi - lo + 1));
+          const tr = regimeTransition[btcRegime] || regimeTransition.chop;
+          const u = rand01(p.gameSeed || 1, "btc_regime", y, m, d);
+          let acc = 0;
+          let nextReg = tr[0][0];
+          for (let i = 0; i < tr.length; i++) {
+            acc += tr[i][1];
+            if (u <= acc) { nextReg = tr[i][0]; break; }
+          }
+          btcRegime = nextReg;
+          const durMap = { chop: [2, 24], bear: [5, 34], bull: [4, 28], panic: [1, 9], squeeze: [1, 8] };
+          const [lo, hi] = durMap[btcRegime] || [2, 16];
+          btcRegimeLeft = lo + Math.floor(rand01(p.gameSeed || 1, "btc_regime_dur", y, m, d) * (hi - lo + 1));
         } else {
           btcRegimeLeft -= 1;
         }
         const reg = {
-          chop: { drift: 0.00002, volMul: 0.75, phi: -0.08 },
-          bear: { drift: -0.00155, volMul: 1.35, phi: 0.18 },
-          bull: { drift: 0.00125, volMul: 1.15, phi: 0.16 },
-          panic: { drift: -0.0052, volMul: 2.1, phi: 0.32 },
-          squeeze: { drift: 0.0042, volMul: 1.95, phi: 0.28 },
-        }[btcRegime] || { drift: 0, volMul: 1, phi: 0 };
-        const z1 = randSigned(p.gameSeed || 1, "btc_z1", y, m, d);
-        const z2 = randSigned(p.gameSeed || 1, "btc_z2", y, m, d);
-        const z = (z1 + z2 + randSigned(p.gameSeed || 1, "btc_z3", y, m, d)) / 1.75;
-        const coreTarget = clamp(
-          0.015 +
-            Math.abs(sig.btc) * 0.34 +
-            Math.abs(phasePenalty.btc) * 0.65 +
-            hawkish * 0.001 +
-            ((p.scenario?.vol || 1) - 1) * 0.01,
-          0.010,
-          0.12,
-        );
-        const btcVol = clamp(prevVol * 0.88 + coreTarget * 0.12, 0.009, 0.16);
-        const eps = clamp(prevEps * 0.42 + z * btcVol * reg.volMul, -0.22, 0.22);
-        const drift = 0.00012 + (p.scenario?.btcBias || 0) * 0.22 + macroMul.btc * 0.45 + phasePenalty.btc * 0.45 + ratePenalty.btc * 0.9 + reg.drift;
-        const ar = clamp(prevRet * (0.14 + reg.phi), -0.1, 0.1);
-        const jRoll = h32(p.gameSeed || 1, "btc_jump", y, m, d) / 0xffffffff;
-        const jProb = clamp(0.016 + btcVol * 0.52 + (btcRegime === "panic" || btcRegime === "squeeze" ? 0.02 : 0), 0.012, 0.12);
-        const jMagSeed = h32(p.gameSeed || 1, "btc_jump_mag", y, m, d) / 0xffffffff;
-        const dirSeed = randSigned(p.gameSeed || 1, "btc_jump_dir", y, m, d);
-        const dirBias = (btcRegime === "bear" ? -0.35 : 0) + (btcRegime === "panic" ? -0.55 : 0) + (btcRegime === "bull" ? 0.25 : 0) + (btcRegime === "squeeze" ? 0.5 : 0);
+          chop: { drift: 0.0, volMul: 0.9, phi: 0.11 },
+          bear: { drift: -0.0013, volMul: 1.45, phi: 0.22 },
+          bull: { drift: 0.0011, volMul: 1.22, phi: 0.2 },
+          panic: { drift: -0.0041, volMul: 2.3, phi: 0.31 },
+          squeeze: { drift: 0.0032, volMul: 2.0, phi: 0.29 },
+        }[btcRegime] || { drift: 0, volMul: 1, phi: 0.1 };
+        // GARCH-like volatility update (prevents easy alternation and allows clustered chaos)
+        const omega = 0.000018;
+        const alpha = 0.19;
+        const beta = 0.79;
+        const prevVar = Math.max(0.00003, prevVol * prevVol);
+        const newVar = clamp(omega + alpha * prevRet * prevRet + beta * prevVar, 0.00002, 0.07);
+        const btcVol = clamp(Math.sqrt(newVar) * reg.volMul, 0.009, 0.22);
+        // Slowly varying latent trend (supports long streaks and long sideways)
+        const trendNoise = gaussian(p.gameSeed || 1, "btc_trend", y, m, d) * 0.00055;
+        const btcTrend = clamp(prevTrend * 0.985 + trendNoise + reg.drift * 0.08, -0.0085, 0.0085);
+        // Heavy-tail noise + short memory shock
+        const tail = studentLike(p.gameSeed || 1, "btc_tail", y, m, d);
+        const eps = clamp(prevEps * 0.33 + tail * btcVol * 0.78, -0.34, 0.34);
+        const drift = 0.00008 + projectedDrift("btc", y, m) * 0.2 + (p.scenario?.btcBias || 0) * 0.15 + macroMul.btc * 0.32 + phasePenalty.btc * 0.4 + ratePenalty.btc * 0.82 + btcTrend;
+        const ar = clamp(prevRet * reg.phi, -0.14, 0.14);
+        const jRoll = rand01(p.gameSeed || 1, "btc_jump", y, m, d);
+        const jProb = clamp(0.008 + btcVol * 0.4 + (btcRegime === "panic" || btcRegime === "squeeze" ? 0.03 : 0), 0.008, 0.2);
+        const jMagSeed = rand01(p.gameSeed || 1, "btc_jump_mag", y, m, d);
+        const dirSeed = gaussian(p.gameSeed || 1, "btc_jump_dir", y, m, d);
+        const dirBias = (btcRegime === "bear" ? -0.45 : 0) + (btcRegime === "panic" ? -0.85 : 0) + (btcRegime === "bull" ? 0.35 : 0) + (btcRegime === "squeeze" ? 0.75 : 0);
         const jDir = (dirSeed + dirBias) >= 0 ? 1 : -1;
-        const jump = jRoll < jProb ? jDir * (0.016 + Math.pow(jMagSeed, 0.55) * 0.18) : 0;
-        const dailyRet = clamp(drift + ar + eps + jump, -0.32, 0.32);
+        const jump = jRoll < jProb ? jDir * (0.012 + Math.pow(jMagSeed, 0.45) * 0.26) : 0;
+        const dailyRet = clamp(drift + ar + eps + jump, -0.45, 0.45);
         let btcUsd = Math.max(7000, p.btcUsd * (1 + dailyRet));
         const ev = EVENTS.find((e) => e.y === y && e.m === m && e.d === d);
         if (ev && !p.doneEvents.includes(`${ev.y}-${ev.m}-${ev.d}`)) {
@@ -1816,6 +1853,7 @@ export default function App() {
           btcPrevRet: dailyRet,
           btcVol,
           btcEps: eps,
+          btcTrend,
           btcRegime,
           btcRegimeLeft,
           cash,
@@ -3256,6 +3294,20 @@ export default function App() {
             {s}x
           </button>
         ))}
+        <button
+          style={S.speed}
+          onClick={() => {
+            try {
+              localStorage.setItem("btc_tycoon_save_v1", JSON.stringify({ ...G, multi, players }));
+              setSavedGame({ ...G, multi, players });
+              setToast("게임 저장 완료");
+            } catch (_e) {
+              setToast("저장 실패");
+            }
+          }}
+        >
+          저장하기
+        </button>
         <button
           style={S.speed}
           onClick={() => {
