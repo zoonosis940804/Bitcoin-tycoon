@@ -3,6 +3,7 @@ import { BTC_RET_REAL } from "./btcReturns";
 
 const KRW_RATE = 1473;
 const MONTHLY_SALARY = 3_000_000;
+const BUILD_ID = "roomlist-v2-20260315-01";
 const ENV_WS_URL = typeof import.meta !== "undefined" ? import.meta?.env?.VITE_RT_WS_URL : "";
 const DEFAULT_WS_URL =
   ENV_WS_URL ||
@@ -1032,6 +1033,7 @@ function Setup({ onStart, onContinue, canContinue, roomList = [], roomListLoadin
     <div style={S.bgCenter}>
       <div style={S.card}>
         <h1 style={S.h1}>비트코인 타이쿤</h1>
+        <div style={{ ...S.muted, color: "#22c55e", fontWeight: 700 }}>BUILD: {BUILD_ID}</div>
         <div style={{ ...S.muted, color: "#93c5fd" }}>WS: {DEFAULT_WS_URL}</div>
         <input value={nickname} onChange={(e) => setNickname(e.target.value.slice(0, 12))} placeholder="트레이더 닉네임" style={S.input} />
         <div style={S.row}>
@@ -1428,6 +1430,13 @@ export default function App() {
   const [roomList, setRoomList] = useState([]);
   const [roomListLoading, setRoomListLoading] = useState(false);
   const [roomListConnected, setRoomListConnected] = useState(false);
+
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      window.__BTC_TYCOON_BUILD__ = BUILD_ID;
+    }
+    console.log("[btc-tycoon] build:", BUILD_ID);
+  }, []);
 
   const btcKrw = useMemo(() => (G ? G.btcUsd * KRW_RATE : 0), [G]);
   const rivalBoard = useMemo(() => {
